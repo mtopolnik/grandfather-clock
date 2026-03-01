@@ -62,8 +62,9 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
     /** Number of ticks detected. */
     private var tickCount: Int = 0
 
-    /** Individual tick-to-tick intervals in microseconds, for stddev calculation. */
-    private val tickIntervals = mutableListOf<Double>()
+    /** Recent tick-to-tick intervals in microseconds, rolling window for stddev. */
+    private val tickIntervals = ArrayDeque<Double>(32)
+    private val tickIntervalWindow = 30
 
     /** Recent beat-to-beat intervals for median calculation. */
     private val recentIntervals = ArrayDeque<Double>(12)
@@ -153,7 +154,12 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
                                 firstTickSample = triggerPeakSample
                             } else {
                                 val intervalMicros = (triggerPeakSample - latestTickSample).toDouble() / sampleRate * 1_000_000.0
-                                tickIntervals.add(intervalMicros)
+                                // Only keep normal tick intervals; reject outliers from missed ticks
+                                val expectedMicros = medianInterval * 2 * 1000.0
+                                if (medianInterval == 0.0 || (intervalMicros > expectedMicros * 0.7 && intervalMicros < expectedMicros * 1.3)) {
+                                    tickIntervals.addLast(intervalMicros)
+                                    if (tickIntervals.size > tickIntervalWindow) tickIntervals.removeFirst()
+                                }
                             }
                             latestTickSample = triggerPeakSample
                         }
@@ -182,9 +188,11 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
             if (tickIntervals.size >= 2) {
                 val mean = tickIntervals.average()
                 val variance = tickIntervals.sumOf { (it - mean) * (it - mean) } / (tickIntervals.size - 1)
-                uncertaintyMicros = sqrt(variance)
+                val stddev = sqrt(variance)
+                // Standard error of the mean, 3-sigma
+                uncertaintyMicros = 3.0 * stddev / sqrt(tickIntervals.size.toDouble())
                 // Synced when we have enough data and stddev is < 0.1% of period
-                synced = tickIntervals.size >= 4 && uncertaintyMicros < periodMicros * 0.001
+                synced = tickIntervals.size >= 4 && stddev < periodMicros * 0.001
             } else {
                 uncertaintyMicros = 0.0
                 synced = false
