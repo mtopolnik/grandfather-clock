@@ -9,11 +9,14 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -28,7 +31,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.example.grandfatherclock.MainViewModel
 import com.example.grandfatherclock.ui.theme.IdleGray
 import com.example.grandfatherclock.ui.theme.Orange
@@ -91,7 +96,7 @@ fun ClockTunerScreen(
                         else MaterialTheme.colorScheme.onBackground.copy(alpha = 0.7f)
 
                     Text(
-                        text = "\u03C3 $uncFormatted \u00B5s",
+                        text = "\u00B1 $uncFormatted \u00B5s",
                         style = MaterialTheme.typography.bodyLarge,
                         color = uncColor,
                     )
@@ -147,16 +152,34 @@ fun ClockTunerScreen(
 
             // Start / Stop button
             if (!hasPermission) {
-                Button(onClick = onRequestPermission) {
-                    Text("Grant Microphone Permission")
+                Button(
+                    onClick = onRequestPermission,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(72.dp),
+                    shape = RoundedCornerShape(16.dp),
+                ) {
+                    Text(
+                        "Grant Microphone Permission",
+                        fontSize = 20.sp,
+                        fontWeight = FontWeight.Bold,
+                    )
                 }
             } else {
                 Button(
                     onClick = {
                         if (state.running) viewModel.stop() else viewModel.start()
                     },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(72.dp),
+                    shape = RoundedCornerShape(16.dp),
                 ) {
-                    Text(if (state.running) "Stop" else "Start")
+                    Text(
+                        if (state.running) "Stop" else "Start",
+                        fontSize = 24.sp,
+                        fontWeight = FontWeight.Bold,
+                    )
                 }
             }
         }
