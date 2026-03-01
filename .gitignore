@@ -1,0 +1,25 @@
+# Gradle
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# IDE
+.idea/
+*.iml
+
+# Local config
+local.properties
+
+# Android
+*.apk
+*.aab
+*.ap_
+
+# WAV recordings
+*.wav
+
+# OS
+.DS_Store
+
+# Claude Code
+.claude/
