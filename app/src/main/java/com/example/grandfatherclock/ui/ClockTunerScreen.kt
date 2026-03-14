@@ -16,7 +16,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -71,45 +70,15 @@ fun ClockTunerScreen(
 
             Spacer(modifier = Modifier.height(40.dp))
 
-            // Period display
-            if (state.tickCount >= 2) {
-                val formatted = NumberFormat.getNumberInstance(Locale.US).apply {
-                    maximumFractionDigits = 1
-                    minimumFractionDigits = 1
-                }.format(state.periodMicros)
-
-                Text(
-                    text = "$formatted \u00B5s",
-                    style = MaterialTheme.typography.displayLarge,
-                    color = MaterialTheme.colorScheme.onBackground,
+            // Real-time period (always shown once available)
+            if (state.periodMicros > 0) {
+                PeriodDisplay(
+                    label = "Real-time",
+                    periodMicros = state.periodMicros,
+                    uncertaintyMicros = state.uncertaintyMicros,
+                    synced = state.synced,
+                    isLarge = state.wavPeriodMicros <= 0,
                 )
-
-                Spacer(modifier = Modifier.height(8.dp))
-
-                if (state.uncertaintyMicros > 0) {
-                    val uncFormatted = NumberFormat.getNumberInstance(Locale.US).apply {
-                        maximumFractionDigits = 1
-                        minimumFractionDigits = 1
-                    }.format(state.uncertaintyMicros)
-
-                    val uncColor = if (state.synced) SyncGreen
-                        else MaterialTheme.colorScheme.onBackground.copy(alpha = 0.7f)
-
-                    Text(
-                        text = "\u00B1 $uncFormatted \u00B5s",
-                        style = MaterialTheme.typography.bodyLarge,
-                        color = uncColor,
-                    )
-                }
-
-                if (state.synced) {
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = "SYNCED",
-                        style = MaterialTheme.typography.titleMedium,
-                        color = SyncGreen,
-                    )
-                }
             } else if (state.running) {
                 Text(
                     text = "Listening\u2026",
@@ -118,10 +87,29 @@ fun ClockTunerScreen(
                 )
             }
 
+            // WAV-refined period (shown after stop, below the real-time value)
+            if (state.wavPeriodMicros > 0) {
+                Spacer(modifier = Modifier.height(24.dp))
+                PeriodDisplay(
+                    label = "Full recording",
+                    periodMicros = state.wavPeriodMicros,
+                    uncertaintyMicros = state.wavUncertaintyMicros,
+                    synced = true,
+                    isLarge = true,
+                )
+            } else if (state.analyzing) {
+                Spacer(modifier = Modifier.height(24.dp))
+                Text(
+                    text = "Analyzing recording\u2026",
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
+
             Spacer(modifier = Modifier.height(32.dp))
 
             // Stats
-            if (state.running) {
+            if (state.running || state.beatCount > 0) {
                 Text(
                     text = "Ticks: ${state.tickCount}   Beats: ${state.beatCount}",
                     style = MaterialTheme.typography.bodyMedium,
@@ -144,8 +132,8 @@ fun ClockTunerScreen(
             if (!state.running && state.wavPath != null) {
                 Text(
                     text = "WAV saved: ${state.wavPath}",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.primary,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.4f),
                 )
                 Spacer(modifier = Modifier.height(16.dp))
             }
@@ -183,6 +171,45 @@ fun ClockTunerScreen(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun PeriodDisplay(
+    label: String,
+    periodMicros: Double,
+    uncertaintyMicros: Double,
+    synced: Boolean,
+    isLarge: Boolean,
+) {
+    val numFmt = NumberFormat.getNumberInstance(Locale.US).apply {
+        maximumFractionDigits = 1
+        minimumFractionDigits = 1
+    }
+
+    Text(
+        text = label,
+        style = MaterialTheme.typography.labelMedium,
+        color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.5f),
+    )
+
+    Spacer(modifier = Modifier.height(4.dp))
+
+    Text(
+        text = "${numFmt.format(periodMicros)} \u00B5s",
+        style = if (isLarge) MaterialTheme.typography.displayLarge
+                else MaterialTheme.typography.headlineMedium,
+        color = MaterialTheme.colorScheme.onBackground,
+    )
+
+    if (uncertaintyMicros > 0) {
+        Spacer(modifier = Modifier.height(4.dp))
+        Text(
+            text = "\u00B1 ${numFmt.format(uncertaintyMicros)} \u00B5s",
+            style = MaterialTheme.typography.bodyLarge,
+            color = if (synced) SyncGreen
+                    else MaterialTheme.colorScheme.onBackground.copy(alpha = 0.7f),
+        )
     }
 }
 

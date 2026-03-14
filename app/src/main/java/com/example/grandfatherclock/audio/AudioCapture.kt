@@ -15,7 +15,6 @@ class AudioCapture(
 ) {
     companion object {
         const val SAMPLE_RATE = 44100
-        const val SAVE_WAV = false
         private const val CHANNEL = AudioFormat.CHANNEL_IN_MONO
         private const val ENCODING = AudioFormat.ENCODING_PCM_16BIT
     }
@@ -49,7 +48,7 @@ class AudioCapture(
         val buffer = ShortArray(readSize)
 
         // Set up WAV file if enabled and output dir is provided
-        val raf = wavOutputDir?.takeIf { SAVE_WAV }?.let { dir ->
+        val raf = wavOutputDir?.let { dir ->
             dir.mkdirs()
             val file = File(dir, "clock_recording.wav")
             wavFile = file
