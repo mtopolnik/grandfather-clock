@@ -7,6 +7,7 @@ import com.example.grandfatherclock.audio.SessionLogger
 import com.example.grandfatherclock.audio.TickDetector
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -43,6 +44,11 @@ class MainViewModel : ViewModel() {
     private val tickDetector = TickDetector()
     private var sessionLogger: SessionLogger? = null
     private var wavAnalysisJob: Job? = null
+    private var autoStopJob: Job? = null
+
+    companion object {
+        private const val MAX_SESSION_MILLIS = 6 * 60 * 1000L // 6 minutes
+    }
 
     var wavOutputDir: File? = null
 
@@ -77,9 +83,17 @@ class MainViewModel : ViewModel() {
             wavOutputDir = wavOutputDir,
         )
         audioCapture?.start()
+
+        autoStopJob?.cancel()
+        autoStopJob = viewModelScope.launch {
+            delay(MAX_SESSION_MILLIS)
+            stop()
+        }
     }
 
     fun stop() {
+        autoStopJob?.cancel()
+        autoStopJob = null
         audioCapture?.stop()
         val wavFile = audioCapture?.wavFile
         val path = wavFile?.absolutePath
