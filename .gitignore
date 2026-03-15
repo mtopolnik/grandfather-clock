@@ -18,6 +18,9 @@ local.properties
 # WAV recordings
 *.wav
 
+# Log files
+*.log
+
 # OS
 .DS_Store
 
