@@ -15,9 +15,9 @@ import kotlin.math.sqrt
  * Detects tick/tock beats from PCM audio and measures the pendulum period.
  *
  * Processes audio one 5 ms frame at a time:
- * 1. Each frame's high-frequency energy (>= 2 kHz via FFT) is computed and
- *    stored in a 40-frame (200 ms) ring buffer.
- * 2. After every new frame, the ring buffer is examined for an isolated
+ * 1. Compute each frame's high-frequency energy (>= 2 kHz via FFT) and
+ *    store it in a 40-frame (200 ms) ring buffer.
+ * 2. After every new frame, examine the ring buffer for an isolated
  *    energy spike (beat). This gives ~5-10 ms detection latency.
  *
  *    Period estimation from detected beats:
@@ -33,7 +33,7 @@ import kotlin.math.sqrt
  * 3. WAV refinement: sample-level template matching on the full recording,
  *    searching +/-20 ms around the approximate period for maximum precision.
  *
- * Clock 1: 1481.5 ms
+ * Clock 1: 1481.56 ms
  * Clock 2: 1153.5 ms
  */
 class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
@@ -48,7 +48,7 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
         val tickCount: Int = 0,
         val beatCount: Int = 0,
         val lastBeatIsTick: Boolean = true,
-        /** True only on the frame where a new beat was detected. */
+        /** True only on the frame where we detected a new beat. */
         val newBeat: Boolean = false,
         val elapsedSamples: Long = 0,
         val synced: Boolean = false,
@@ -130,7 +130,7 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
                 samplesInFrame = 0
             }
         }
-        // If a beat was detected in an earlier frame but a later periodic State
+        // If we detected a beat in an earlier frame but a later periodic State
         // overwrote it, re-set newBeat so the UI doesn't miss the flash.
         if (beatInBuffer && result != null && !result.newBeat) {
             result = result.copy(newBeat = true)
@@ -295,7 +295,7 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
         // parabolic interpolation for fractional-sample precision, then
         // windowed sinc interpolation to extract raw samples at the exact
         // fractional position.  The DoubleArray accumulator has no clipping
-        // risk; the final result is normalized to 90% of 16-bit max.
+        // risk; normalize the final result to 90% of 16-bit max.
         val amplitudeThreshold = 0.9 * 32767
         val sincHalfLen = 8  // 8-tap half-width for windowed sinc kernel
         val refineRange = 3  // ±3 samples for sub-sample refinement
