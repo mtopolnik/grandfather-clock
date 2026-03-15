@@ -608,16 +608,20 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
             return sum / cnt
         }
 
-        // Determine if we have 1 or 2 peaks
-        val twoPeaks = clusters.size >= 2 && clusters[1].count >= 2
+        // Determine if we have 1 or 2 peaks.
+        // Reject any second peak with fewer than 80% of the top peak's count —
+        // genuine half-period peaks have roughly equal counts, while artifacts
+        // (e.g. missed-beat gaps) are far rarer.
         val c1 = clusterCenter(clusters[0])
+        val c2 = if (clusters.size >= 2) clusterCenter(clusters[1]) else 0.0
+        val twoPeaks = clusters.size >= 2
+            && clusters[1].count >= clusters[0].count * 0.8
         val histPeriodFrames: Double
         val halfPeriodCenters: List<Double>
 
         if (twoPeaks) {
             // Two peaks visible — need >= 3 items in each before reporting
             if (clusters[0].count < 3 || clusters[1].count < 3) return
-            val c2 = clusterCenter(clusters[1])
             histPeriodFrames = c1 + c2
             halfPeriodCenters = listOf(c1, c2)
 
@@ -803,7 +807,7 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
             RandomAccessFile(file, "r").use { raf ->
                 raf.seek(44)
                 val dataBytes = (raf.length() - 44).toInt()
-                val maxBytes = sampleRate * 300 * 2
+                val maxBytes = sampleRate * 600 * 2  // 10 minutes
                 val bytesToRead = minOf(dataBytes, maxBytes)
                 val skipSamples = if (dataBytes > maxBytes) (dataBytes - maxBytes) / 2 else 0
                 if (skipSamples > 0) raf.seek(44L + skipSamples * 2L)

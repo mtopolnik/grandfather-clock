@@ -47,7 +47,7 @@ class MainViewModel : ViewModel() {
     private var autoStopJob: Job? = null
 
     companion object {
-        private const val MAX_SESSION_MILLIS = 6 * 60 * 1000L // 6 minutes
+        private const val MAX_SESSION_MILLIS = 610 * 1000L // 10 min 10 sec
     }
 
     var wavOutputDir: File? = null
