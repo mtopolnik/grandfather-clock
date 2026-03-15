@@ -61,7 +61,8 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
     private val overlapFrames = windowFrames - slideFrames   // 12 frames = 60 ms
     private val windowSamples = frameSamples * windowFrames
     private val slideSamples = frameSamples * slideFrames
-    private val minBeatGapFrames = 80                        // 400 ms between beats
+    private val initialMinBeatGapFrames = 80                  // 400 ms between beats
+    private var minBeatGapFrames = initialMinBeatGapFrames
 
     // ---- FFT for high-frequency energy ----
     private val fftSize = 256                                // next power-of-2 ≥ frameSamples
@@ -103,15 +104,18 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
     //  Public API
     // ================================================================
 
-    fun process(buffer: ShortArray, count: Int): State? {
-        var offset = 0
+    fun process(buffer: ShortArray, count: Int): State? = process(buffer, 0, count)
+
+    fun process(buffer: ShortArray, bufferOffset: Int, count: Int): State? {
+        var pos = bufferOffset
+        val end = bufferOffset + count
         var result: State? = null
 
-        while (offset < count) {
-            val toCopy = minOf(windowSamples - samplesInBuffer, count - offset)
-            System.arraycopy(buffer, offset, sampleBuffer, samplesInBuffer, toCopy)
+        while (pos < end) {
+            val toCopy = minOf(windowSamples - samplesInBuffer, end - pos)
+            System.arraycopy(buffer, pos, sampleBuffer, samplesInBuffer, toCopy)
             samplesInBuffer += toCopy
-            offset += toCopy
+            pos += toCopy
             totalSamples += toCopy
 
             if (samplesInBuffer >= windowSamples) {
@@ -125,141 +129,154 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
     }
 
     fun analyzeWavFile(wavFile: File): State? {
-        if (periodMicros <= 0.0) return null
+        if (periodMicros <= 0.0 || beatFrames.size < 8) return null
 
         val rawSamples = readWav(wavFile) ?: return null
         val n = rawSamples.size
         if (n < sampleRate * 3) return null
 
-        // --- Step 1: find coarse beat positions via HF energy at 5 ms ---
-        val wavFrame = sampleRate / 200                    // 220 samples = 5 ms
-        val wavFftSize = 256
-        val wavHfStart = (2000.0 * wavFftSize / sampleRate).toInt() + 1
-        val wavHfCount = wavFftSize / 2 + 1 - wavHfStart
-        val wavHann = DoubleArray(wavFrame) {
-            0.5 * (1 - cos(2.0 * PI * it / (wavFrame - 1)))
-        }
-        val numFrames = n / wavFrame
-        val hfEnergy = DoubleArray(numFrames)
-        val localBuf = DoubleArray(wavFftSize * 2)
-        for (f in 0 until numFrames) {
-            for (i in localBuf.indices) localBuf[i] = 0.0
-            val base = f * wavFrame
-            for (i in 0 until wavFrame) {
-                localBuf[2 * i] = rawSamples[base + i].toDouble() * wavHann[i]
-            }
-            fft(localBuf, wavFftSize)
-            var sum = 0.0
-            for (k in wavHfStart..wavFftSize / 2) {
-                val re = localBuf[2 * k]; val im = localBuf[2 * k + 1]
-                sum += re * re + im * im
-            }
-            hfEnergy[f] = sqrt(sum / wavHfCount)
-        }
+        val approxPeriodSamples = periodMicros / 1_000_000.0 * sampleRate
+        val approxHalfPeriod = approxPeriodSamples / 2.0
 
-        // Find beats: HF-energy peaks above threshold with dead zone
-        val sorted = hfEnergy.copyOf().also { it.sort() }
-        val median = sorted[numFrames / 2]
-        val beatThresh = maxOf(median * 3.0, 1000.0)
-        val deadZone = sampleRate / (wavFrame * 5)         // ~200 ms in 5 ms frames
-        val beats = mutableListOf<Int>()                    // frame indices
-        var lastBeatF = -deadZone
-        for (f in 0 until numFrames) {
-            if (hfEnergy[f] > beatThresh && f - lastBeatF >= deadZone) {
-                beats.add(f)
-                lastBeatF = f
-            }
-        }
-        if (beats.size < 6) {
-            logger?.log("WAV_ANALYSIS", "Too few beats: ${beats.size} (need 6)")
-            return null
-        }
-        logger?.log("WAV_ANALYSIS",
-            "samples=%d frames=%d beats=%d threshold=%.0f median=%.0f"
-                .format(n, numFrames, beats.size, beatThresh, median))
+        // --- Preparation: diff-filter and group beats ---
 
-        // --- Step 2: diff-filter the raw signal for sharp cross-correlation ---
-        // y[n] = x[n] − x[n−1] removes low-frequency content that would
-        // broaden the correlation peak. The tick transient's sharp edges
-        // become the dominant feature, giving sub-sample matching precision.
         val diff = DoubleArray(n)
         for (i in 1 until n) diff[i] = rawSamples[i].toDouble() - rawSamples[i - 1].toDouble()
 
-        // --- Step 3: template-match an early beat with a late beat ---
-        // Use dead reckoning (approximate period × N) to determine how many
-        // tick-to-tick periods fit, then cross-correlate to find the precise
-        // sample offset. Period = span / N.
-        val tplLen = frameSamples                           // 220 samples = 5 ms
-        val tplHalf = tplLen / 2
-        val tplWindow = DoubleArray(tplLen) {
-            0.5 * (1 - cos(2.0 * PI * it / (tplLen - 1)))
-        }
-        val approxTtSamples = periodMicros / 1_000_000.0 * sampleRate
-        val searchHalf = wavFrame * 4                       // ±20 ms in samples
-
-        // Single template matched at several distances (N, N−2, N−4, …
-        // tick-to-tick periods — all same beat type). We keep the two
-        // strongest-correlation matches for period + uncertainty.
-        if (beats.size < 5) return null
-        val earlyIdx = 2
-        val earlyCenter = beats[earlyIdx] * wavFrame + wavFrame / 2
-        val available = n - earlyCenter - tplLen
-        val maxN = (available / approxTtSamples).toInt()
-        if (maxN < 4) return null
-
-        // Template from early beat (windowed diff signal)
-        val tpl = DoubleArray(tplLen) { i ->
-            val pos = earlyCenter - tplHalf + i
-            if (pos in 0 until n) diff[pos] * tplWindow[i] else 0.0
-        }
-
-        fun xcDiff(c: Int): Double {
-            var s = 0.0
-            for (i in 0 until tplLen) {
-                val pos = c - tplHalf + i
-                if (pos in 0 until n) s += tpl[i] * diff[pos]
+        // Separate beats into two groups (tick-type / tock-type) using pair
+        // formation: consecutive beats with a valid half-period gap.
+        val halfMin = approxHalfPeriod * 0.85
+        val halfMax = approxHalfPeriod * 1.15
+        val groupA = mutableListOf<Int>()   // approximate sample positions
+        val groupB = mutableListOf<Int>()
+        var idx = 0
+        while (idx < beatFrames.size - 1) {
+            val posA = beatFrames[idx] * frameSamples
+            val posB = beatFrames[idx + 1] * frameSamples
+            val gap = posB - posA
+            if (gap >= halfMin && gap <= halfMax) {
+                groupA.add(posA)
+                groupB.add(posB)
+                idx += 2
+            } else {
+                idx += 1
             }
-            return s
         }
 
-        // Try N, N−2, N−4, … (same beat type), keep the two with
-        // the strongest cross-correlation peaks.
-        data class MatchResult(val periodMicros: Double, val peakCorr: Double)
-        val matches = mutableListOf<MatchResult>()
-        for (numPeriods in maxN downTo maxOf(maxN - 12, 2) step 2) {
-            val predicted = earlyCenter + (numPeriods * approxTtSamples).toInt()
-            if (predicted + tplHalf >= n || predicted - tplHalf < 0) continue
+        if (groupA.size < 4 || groupB.size < 4) {
+            logger?.log("WAV_ANALYSIS", "Too few paired beats: A=${groupA.size} B=${groupB.size}")
+            return null
+        }
+        logger?.log("WAV_ANALYSIS",
+            "samples=%d paired_beats: A=%d B=%d".format(n, groupA.size, groupB.size))
 
-            var bestOff = 0; var bestVal = Double.NEGATIVE_INFINITY
-            for (off in -searchHalf..searchHalf) {
-                val c = xcDiff(predicted + off)
-                if (c > bestVal) { bestVal = c; bestOff = off }
+        // --- Phase 2: Build templates by iterative align-and-average ---
+
+        val tplWidth = sampleRate / 50                     // 20 ms = 882 samples
+        val tplHalf = tplWidth / 2
+        val searchRange = frameSamples                     // ±1 frame = ±220 samples
+
+        fun buildTemplate(group: List<Int>): DoubleArray {
+            // Seed with first beat
+            val tpl = DoubleArray(tplWidth)
+            val c0 = group[0]
+            for (j in 0 until tplWidth) {
+                val pos = c0 - tplHalf + j
+                if (pos in 0 until n) tpl[j] = diff[pos]
             }
-            // Skip if the peak hit the search boundary (unreliable)
-            if (abs(bestOff) >= searchHalf - 5) continue
 
-            val pc = predicted + bestOff
-            val cm = xcDiff(pc - 1); val cp = xcDiff(pc + 1)
-            val denom = 2.0 * (2.0 * bestVal - cp - cm)
-            val delta = if (denom != 0.0) (cp - cm) / denom else 0.0
-            val span = (pc + delta) - earlyCenter.toDouble()
-            matches.add(MatchResult(span / numPeriods / sampleRate * 1_000_000.0, bestVal))
+            // Iteratively align and average subsequent beats
+            for (k in 1 until group.size) {
+                val center = group[k]
+                var bestOff = 0
+                var bestDot = Double.NEGATIVE_INFINITY
+                for (off in -searchRange..searchRange) {
+                    var dot = 0.0
+                    for (j in 0 until tplWidth) {
+                        val pos = center - tplHalf + off + j
+                        if (pos in 0 until n) dot += tpl[j] * diff[pos]
+                    }
+                    if (dot > bestDot) { bestDot = dot; bestOff = off }
+                }
+
+                // Average aligned window into template
+                for (j in 0 until tplWidth) {
+                    val pos = center - tplHalf + bestOff + j
+                    val s = if (pos in 0 until n) diff[pos] else 0.0
+                    tpl[j] = (tpl[j] * k + s) / (k + 1)
+                }
+            }
+            return tpl
         }
-        if (matches.isEmpty()) return null
 
-        // Sort by correlation strength, take the best two
-        matches.sortByDescending { it.peakCorr }
-        val periods = matches.take(2).map { it.periodMicros }
+        val templateA = buildTemplate(groupA)
+        val templateB = buildTemplate(groupB)
 
-        val wavPeriod = periods.average()
-        val wavUncertainty = if (periods.size >= 2) {
-            abs(periods[0] - periods[1]) * 1.5
-        } else 0.0
+        // --- Phase 3: Final-pass alignment against clean templates ---
+
+        fun alignBeat(center: Int, tpl: DoubleArray): Int {
+            var bestOff = 0
+            var bestDot = Double.NEGATIVE_INFINITY
+            for (off in -searchRange..searchRange) {
+                var dot = 0.0
+                for (j in 0 until tplWidth) {
+                    val pos = center - tplHalf + off + j
+                    if (pos in 0 until n) dot += tpl[j] * diff[pos]
+                }
+                if (dot > bestDot) { bestDot = dot; bestOff = off }
+            }
+            return bestOff
+        }
+
+        val preciseA = DoubleArray(groupA.size) { (groupA[it] + alignBeat(groupA[it], templateA)).toDouble() }
+        val preciseB = DoubleArray(groupB.size) { (groupB[it] + alignBeat(groupB[it], templateB)).toDouble() }
+
+        // --- Phase 4: Midpoint regression at sample level ---
+        // Same approach as the real-time best-fit (half-period grid on pair
+        // midpoints) but using precise sample-level positions.
+        val m = minOf(preciseA.size, preciseB.size)
+        if (m < 4) return null
+
+        val midpoints = DoubleArray(m) { (preciseA[it] + preciseB[it]) / 2.0 }
+        val approxHalfPeriodSamples = approxPeriodSamples / 2.0
+
+        val indices = IntArray(m)
+        for (j in 1 until m) {
+            indices[j] = ((midpoints[j] - midpoints[0]) / approxHalfPeriodSamples).roundToInt()
+        }
+
+        // Linear regression: midpoints[j] = t0 + indices[j] * halfP
+        var sk = 0.0; var skk = 0.0; var sp = 0.0; var skp = 0.0
+        for (j in 0 until m) {
+            val k = indices[j].toDouble()
+            val p = midpoints[j]
+            sk += k; skk += k * k; sp += p; skp += k * p
+        }
+
+        val det = m.toDouble() * skk - sk * sk
+        if (abs(det) < 1e-12) return null
+
+        val halfP = (m.toDouble() * skp - sk * sp) / det
+        if (halfP <= 0) return null
+
+        val period = halfP * 2.0
+
+        var sumResidualSq = 0.0
+        val t0 = (skk * sp - sk * skp) / det
+        for (j in 0 until m) {
+            val residual = midpoints[j] - (t0 + indices[j] * halfP)
+            sumResidualSq += residual * residual
+        }
+        val sigma2 = if (m > 2) sumResidualSq / (m - 2) else 0.0
+        val halfPVar = if (abs(det) > 1e-20 && m > 2) m.toDouble() / det * sigma2 else 0.0
+        val rmsResidual = if (m > 2) sqrt(sigma2) else 0.0
+
+        val wavPeriod = period / sampleRate * 1_000_000.0
+        val wavUncertainty = if (halfPVar > 0) 2.0 * sqrt(halfPVar) / sampleRate * 1_000_000.0 else 0.0
 
         logger?.log("WAV_RESULT",
-            "period=%.1fµs ±%.1fµs matches=%d best_periods=%s"
-                .format(wavPeriod, wavUncertainty, matches.size,
-                    periods.map { "%.1f".format(it) }))
+            "period=%.3f samples (%.1fµs ±%.1fµs) pairs=%d rms=%.2f"
+                .format(period, wavPeriod, wavUncertainty, m, rmsResidual))
 
         periodMicros = wavPeriod
         uncertaintyMicros = wavUncertainty
@@ -289,6 +306,7 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
         lastBeatIsTick = true
         lastBeatFrame = -100
         beatFrames.clear()
+        minBeatGapFrames = initialMinBeatGapFrames
         periodMicros = 0.0
         uncertaintyMicros = 0.0
         method = Method.NONE
@@ -377,7 +395,7 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
             if (energy[f] > energy[peakFrame]) peakFrame = f
         }
 
-        val threshold = median + (peak - median) * 0.5
+        val threshold = median + (peak - median) * 0.8
 
         // Expand outward from peak to find the contiguous streak of loud frames
         var spikeStart = peakFrame
@@ -523,6 +541,14 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
         uncertaintyMicros = 0.0
         synced = false
 
+        // Adapt dead zone: prevent false beats from echoes within the half-period
+        val adaptiveGap = (halfPeriodCenters.min() - 10).toInt()
+        if (adaptiveGap > minBeatGapFrames) {
+            minBeatGapFrames = adaptiveGap
+            logger?.log("DEAD_ZONE_ADAPT", "minBeatGapFrames=%d (%dms)"
+                .format(minBeatGapFrames, minBeatGapFrames * frameSamples * 1000 / sampleRate))
+        }
+
         // Step 3: pair-based best-fit for sub-frame precision
         if (n >= 8) {
             val halfMin = halfPeriodCenters.min() - 10
@@ -535,15 +561,15 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
      * Pair-based least-squares fit for the full tick-to-tick period.
      *
      * Groups consecutive detected beats into pairs where the gap matches
-     * a known half-period (from the histogram). Each pair represents one
-     * tick-tock or tock-tick unit. The period is how often these pairs
-     * repeat. This is robust to missed beats: a missed beat simply means
-     * a pair doesn't form, without corrupting the indices of other pairs.
+     * a known half-period (from the histogram). Uses the **midpoint** of
+     * each pair as its position. Midpoints of tick-tock and tock-tick
+     * pairs both lie on a uniform half-period grid, so if a missed beat
+     * flips the tick/tock labeling, the midpoints still align — the fit
+     * is immune to beat-type flips.
      *
-     * Uses the histogram's approximate period to assign integer indices
-     * to each pair, then fits pairPos[j] = t0 + index[j] * P via linear
-     * regression. The long baseline between early and late pairs recovers
-     * sub-frame precision from accumulated drift.
+     * Assigns indices on the half-period grid, fits
+     *   midpoint[j] = t0 + index[j] * halfP
+     * via linear regression, and reports the full period as 2 * halfP.
      */
     private fun bestFitPeriod(
         approxPeriodFrames: Double,
@@ -552,34 +578,36 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
     ) {
         val n = beatFrames.size
 
-        // Step 1: form pairs — consecutive beats with a valid half-period gap
-        val pairPositions = mutableListOf<Int>()
+        // Step 1: form pairs — consecutive beats with a valid half-period gap.
+        // Record the midpoint of each pair.
+        val pairMidpoints = mutableListOf<Double>()
         var i = 0
         while (i < n - 1) {
             val delta = beatFrames[i + 1] - beatFrames[i]
             if (delta >= halfPeriodMin && delta <= halfPeriodMax) {
-                pairPositions.add(beatFrames[i])
+                pairMidpoints.add((beatFrames[i] + beatFrames[i + 1]) / 2.0)
                 i += 2
             } else {
                 i += 1
             }
         }
 
-        if (pairPositions.size < 4) return
+        if (pairMidpoints.size < 4) return
 
-        // Step 2: assign period indices using approximate period
-        val m = pairPositions.size
+        // Step 2: assign indices on the half-period grid
+        val approxHalfPeriod = approxPeriodFrames / 2.0
+        val m = pairMidpoints.size
         val indices = IntArray(m)
         for (j in 1 until m) {
-            indices[j] = ((pairPositions[j] - pairPositions[0]).toDouble()
-                / approxPeriodFrames).roundToInt()
+            indices[j] = ((pairMidpoints[j] - pairMidpoints[0])
+                / approxHalfPeriod).roundToInt()
         }
 
-        // Step 3: linear regression — pairPos[j] = t0 + indices[j] * P
+        // Step 3: linear regression — midpoint[j] = t0 + indices[j] * halfP
         var sk = 0.0; var skk = 0.0; var sp = 0.0; var skp = 0.0
         for (j in 0 until m) {
             val k = indices[j].toDouble()
-            val p = pairPositions[j].toDouble()
+            val p = pairMidpoints[j]
             sk += k; skk += k * k; sp += p; skp += k * p
         }
 
@@ -587,24 +615,26 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
         if (abs(det) < 1e-12) return
 
         val t0 = (skk * sp - sk * skp) / det
-        val period = (m.toDouble() * skp - sk * sp) / det
-        if (period <= 0) return
+        val halfP = (m.toDouble() * skp - sk * sp) / det
+        if (halfP <= 0) return
+
+        val period = halfP * 2.0  // full tick-to-tick period
 
         // Residuals and uncertainty
         var sumResidualSq = 0.0
         for (j in 0 until m) {
-            val expected = t0 + indices[j] * period
-            val residual = pairPositions[j].toDouble() - expected
+            val expected = t0 + indices[j] * halfP
+            val residual = pairMidpoints[j] - expected
             sumResidualSq += residual * residual
         }
 
         val sigma2 = if (m > 2) sumResidualSq / (m - 2) else 0.0
-        // var(P) = σ² · N / det  where det = N·Σk² − (Σk)²
-        val periodVariance = if (abs(det) > 1e-20 && m > 2) m.toDouble() / det * sigma2 else 0.0
+        // var(halfP) = σ² · N / det; var(period) = 4 · var(halfP)
+        val halfPVar = if (abs(det) > 1e-20 && m > 2) m.toDouble() / det * sigma2 else 0.0
 
         val framesToMicros = frameSamples.toDouble() / sampleRate * 1_000_000.0
         periodMicros = period * framesToMicros
-        uncertaintyMicros = if (periodVariance > 0) sqrt(periodVariance) * framesToMicros else 0.0
+        uncertaintyMicros = if (halfPVar > 0) 2.0 * sqrt(halfPVar) * framesToMicros else 0.0
         method = Method.BEST_FIT
 
         val rmsResidual = if (m > 2) sqrt(sigma2) else 0.0

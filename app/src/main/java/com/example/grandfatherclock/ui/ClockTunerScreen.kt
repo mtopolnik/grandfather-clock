@@ -128,24 +128,6 @@ fun ClockTunerScreen(
 
             Spacer(modifier = Modifier.height(40.dp))
 
-            // WAV file saved indicator
-            if (!state.running && state.wavPath != null) {
-                Text(
-                    text = "WAV saved: ${state.wavPath}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.4f),
-                )
-                Spacer(modifier = Modifier.height(4.dp))
-            }
-            if (!state.running && state.logPath != null) {
-                Text(
-                    text = "Log saved: ${state.logPath}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.4f),
-                )
-                Spacer(modifier = Modifier.height(16.dp))
-            }
-
             // Start / Stop button
             if (!hasPermission) {
                 Button(
@@ -178,6 +160,16 @@ fun ClockTunerScreen(
                     )
                 }
             }
+
+            if (!state.running && state.wavPath != null) {
+                val dir = state.wavPath!!.substringBeforeLast('/')
+                Spacer(modifier = Modifier.height(16.dp))
+                Text(
+                    text = "Debug files saved at $dir",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.4f),
+                )
+            }
         }
     }
 }
@@ -191,8 +183,7 @@ private fun PeriodDisplay(
     isLarge: Boolean,
 ) {
     val numFmt = NumberFormat.getNumberInstance(Locale.US).apply {
-        maximumFractionDigits = 1
-        minimumFractionDigits = 1
+        maximumFractionDigits = 0
     }
 
     Text(
