@@ -135,6 +135,14 @@ fun ClockTunerScreen(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.4f),
                 )
+                Spacer(modifier = Modifier.height(4.dp))
+            }
+            if (!state.running && state.logPath != null) {
+                Text(
+                    text = "Log saved: ${state.logPath}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.4f),
+                )
                 Spacer(modifier = Modifier.height(16.dp))
             }
 

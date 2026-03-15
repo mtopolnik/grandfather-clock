@@ -3,6 +3,7 @@ package com.example.grandfatherclock
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.grandfatherclock.audio.AudioCapture
+import com.example.grandfatherclock.audio.SessionLogger
 import com.example.grandfatherclock.audio.TickDetector
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -32,6 +33,7 @@ class MainViewModel : ViewModel() {
         val wavUncertaintyMicros: Double = 0.0,
         val analyzing: Boolean = false,
         val wavPath: String? = null,
+        val logPath: String? = null,
     )
 
     private val _state = MutableStateFlow(UiState())
@@ -39,6 +41,7 @@ class MainViewModel : ViewModel() {
 
     private var audioCapture: AudioCapture? = null
     private val tickDetector = TickDetector()
+    private var sessionLogger: SessionLogger? = null
     private var wavAnalysisJob: Job? = null
 
     var wavOutputDir: File? = null
@@ -48,7 +51,13 @@ class MainViewModel : ViewModel() {
 
         wavAnalysisJob?.cancel()
         tickDetector.reset()
-        _state.value = UiState(running = true)
+
+        val dir = wavOutputDir
+        sessionLogger?.close()
+        sessionLogger = if (dir != null) SessionLogger(dir) else null
+        tickDetector.logger = sessionLogger
+
+        _state.value = UiState(running = true, logPath = sessionLogger?.filePath)
 
         audioCapture = AudioCapture(
             onBuffer = { buffer, count ->
@@ -81,6 +90,8 @@ class MainViewModel : ViewModel() {
             wavPath = path,
         )
 
+        sessionLogger?.flush()
+
         if (wavFile != null && wavFile.exists()) {
             _state.value = _state.value.copy(analyzing = true)
             wavAnalysisJob = viewModelScope.launch(Dispatchers.IO) {
@@ -94,7 +105,14 @@ class MainViewModel : ViewModel() {
                 } else {
                     _state.value.copy(analyzing = false)
                 }
+                sessionLogger?.close()
+                sessionLogger = null
+                tickDetector.logger = null
             }
+        } else {
+            sessionLogger?.close()
+            sessionLogger = null
+            tickDetector.logger = null
         }
     }
 

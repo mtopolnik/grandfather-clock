@@ -8,32 +8,38 @@ import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.sin
+import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
 /**
  * Detects tick/tock beats from PCM audio and measures the pendulum period.
  *
  * Two-phase approach:
- * 1. Real-time: sliding 200ms window with 140ms advance, 20ms FFT frames.
+ * 1. Real-time: sliding 200ms window with 140ms advance, 5ms FFT frames.
  *    Each frame is analysed via FFT and the high-frequency band energy
  *    (≥ 2 kHz) is used for beat detection. Clock ticks are broadband
  *    transients that light up the full spectrum, while background noise
  *    (voice, handling) is concentrated below 2 kHz, giving a typical
  *    tick/noise ratio of 15–30× (vs 2–3× with plain RMS).
- * 2. WAV refinement: sample-level autocorrelation on the full recording,
- *    searching ±50 ms around the approximate period for maximum precision.
  *
- * The autocorrelation operates on a "beat signal" — the HF energy at
- * detected beat frames with all other frames zeroed, capped to prevent
- * loud transients from dominating.
+ *    Period estimation from detected beats:
+ *    a. Histogram of consecutive beat-frame deltas finds 1 or 2 peaks
+ *       (tick-to-tock and tock-to-tick intervals). The sum of the peak
+ *       centres gives the full tick-to-tick period. Requires ≥ 6 total
+ *       items in the identified peak buckets (≥ 3 per peak if two peaks).
+ *    b. Best-fit: models beat[i] = t0 + (i%2)*T1 + (i/2)*P and solves
+ *       for P via least squares across all detected beats. Exploits the
+ *       long baseline to recover sub-frame precision from accumulated
+ *       drift (the true period is not an exact multiple of 5 ms).
  *
- * Tick-to-tick alignment: autocorrelation naturally produces a stronger
- * peak at the full tick-to-tick period than at the half-period
- * (beat-to-beat), because tick and tock have different amplitudes.
+ * 2. WAV refinement: sample-level template matching on the full recording,
+ *    searching ±20 ms around the approximate period for maximum precision.
  */
 class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
 
-    enum class Method { NONE, AUTOCORRELATION, WAV_REFINED }
+    var logger: SessionLogger? = null
+
+    enum class Method { NONE, HISTOGRAM, BEST_FIT, WAV_REFINED }
 
     data class State(
         val periodMicros: Double = 0.0,
@@ -49,16 +55,16 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
     )
 
     // ---- Frame / window geometry ----
-    private val frameSamples = sampleRate / 50              // 20 ms = 882 @ 44 100
-    private val windowFrames = 10                            // 200 ms
-    private val slideFrames = 7                              // 140 ms
-    private val overlapFrames = windowFrames - slideFrames   // 3 frames = 60 ms
+    private val frameSamples = sampleRate / 200              // 5 ms = 220 @ 44 100
+    private val windowFrames = 40                            // 200 ms
+    private val slideFrames = 28                             // 140 ms
+    private val overlapFrames = windowFrames - slideFrames   // 12 frames = 60 ms
     private val windowSamples = frameSamples * windowFrames
     private val slideSamples = frameSamples * slideFrames
-    private val minBeatGapFrames = 20                        // 400 ms between beats
+    private val minBeatGapFrames = 80                        // 400 ms between beats
 
     // ---- FFT for high-frequency energy ----
-    private val fftSize = 1024                               // next power-of-2 ≥ frameSamples
+    private val fftSize = 256                                // next power-of-2 ≥ frameSamples
     private val hannWindow = DoubleArray(frameSamples) {
         0.5 * (1 - cos(2.0 * PI * it / (frameSamples - 1)))
     }
@@ -71,14 +77,9 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
     private var samplesInBuffer = 0
     private var totalSamples: Long = 0
 
-    // ---- HF-energy history (growable primitive array) ----
-    private var energyData = DoubleArray(2000)
+    // ---- Frame counter (for global frame indexing) ----
     private var energyCount = 0
     private var isFirstWindow = true
-
-    // ---- Beat signal for ACF (parallel to energyData, non-zero only at beats) ----
-    private var beatSignal = DoubleArray(2000)
-    private val energyCap = 20_000.0
 
     // ---- Beat detection ----
     private var beatCount = 0
@@ -86,17 +87,17 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
     private var lastBeatIsTick = true
     private var lastBeatFrame = -100
 
+    // ---- Beat frame positions for period estimation ----
+    private val beatFrames = mutableListOf<Int>()
+
     // ---- Period estimation ----
     private var periodMicros = 0.0
     private var uncertaintyMicros = 0.0
     private var method = Method.NONE
     private var synced = false
 
-    private var acCounter = 0
-    private val acInterval = 6
-
-    private val recentPeriods = ArrayDeque<Double>(25)
-    private val maxRecentPeriods = 20
+    private var estimateCounter = 0
+    private val estimateInterval = 6  // ~once per second (6 windows × 140ms ≈ 840ms)
 
     // ================================================================
     //  Public API
@@ -169,7 +170,13 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
                 lastBeatF = f
             }
         }
-        if (beats.size < 6) return null
+        if (beats.size < 6) {
+            logger?.log("WAV_ANALYSIS", "Too few beats: ${beats.size} (need 6)")
+            return null
+        }
+        logger?.log("WAV_ANALYSIS",
+            "samples=%d frames=%d beats=%d threshold=%.0f median=%.0f"
+                .format(n, numFrames, beats.size, beatThresh, median))
 
         // --- Step 2: diff-filter the raw signal for sharp cross-correlation ---
         // y[n] = x[n] − x[n−1] removes low-frequency content that would
@@ -182,7 +189,7 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
         // Use dead reckoning (approximate period × N) to determine how many
         // tick-to-tick periods fit, then cross-correlate to find the precise
         // sample offset. Period = span / N.
-        val tplLen = frameSamples                           // 882 samples = 20 ms
+        val tplLen = frameSamples                           // 220 samples = 5 ms
         val tplHalf = tplLen / 2
         val tplWindow = DoubleArray(tplLen) {
             0.5 * (1 - cos(2.0 * PI * it / (tplLen - 1)))
@@ -249,6 +256,11 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
             abs(periods[0] - periods[1]) * 1.5
         } else 0.0
 
+        logger?.log("WAV_RESULT",
+            "period=%.1fµs ±%.1fµs matches=%d best_periods=%s"
+                .format(wavPeriod, wavUncertainty, matches.size,
+                    periods.map { "%.1f".format(it) }))
+
         periodMicros = wavPeriod
         uncertaintyMicros = wavUncertainty
         method = Method.WAV_REFINED
@@ -270,20 +282,18 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
     fun reset() {
         samplesInBuffer = 0
         totalSamples = 0
-        energyData = DoubleArray(2000)
-        beatSignal = DoubleArray(2000)
         energyCount = 0
         isFirstWindow = true
         beatCount = 0
         tickCount = 0
         lastBeatIsTick = true
         lastBeatFrame = -100
+        beatFrames.clear()
         periodMicros = 0.0
         uncertaintyMicros = 0.0
         method = Method.NONE
         synced = false
-        acCounter = 0
-        recentPeriods.clear()
+        estimateCounter = 0
     }
 
     // ================================================================
@@ -291,30 +301,21 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
     // ================================================================
 
     private fun analyzeWindow(): State {
-        // Compute high-frequency energy for each 20 ms frame via FFT
+        // Compute high-frequency energy for each 5 ms frame via FFT
         val frameEnergy = DoubleArray(windowFrames) { f ->
             computeHfEnergy(f * frameSamples)
         }
 
-        // Append new frames to history
-        val startFrame = if (isFirstWindow) 0 else overlapFrames
-        for (f in startFrame until windowFrames) {
-            if (energyCount >= energyData.size) {
-                energyData = energyData.copyOf(energyData.size * 2)
-                beatSignal = beatSignal.copyOf(beatSignal.size * 2)
-            }
-            energyData[energyCount] = frameEnergy[f]
-            beatSignal[energyCount] = 0.0
-            energyCount++
-        }
+        // Advance global frame counter
+        energyCount += if (isFirstWindow) windowFrames else slideFrames
         isFirstWindow = false
 
         val newBeat = detectSpike(frameEnergy)
 
-        acCounter++
-        if (acCounter >= acInterval && energyCount >= 100) {
-            acCounter = 0
-            estimatePeriodFromAC()
+        estimateCounter++
+        if (estimateCounter >= estimateInterval && beatFrames.size >= 4) {
+            estimateCounter = 0
+            estimatePeriod()
         }
 
         return State(
@@ -361,149 +362,262 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
         val peak = energy.max()
 
         // HF energy gives 15–30× tick/noise ratio; 3× is a safe pre-filter
-        if (peak < median * 3.0 || peak < 1000.0) return false
+        if (peak < median * 3.0 || peak < 1000.0) {
+            if (peak > median * 1.5 && peak > 500.0) {
+                val audioTime = totalSamples.toDouble() / sampleRate
+                logger?.log("SPIKE_BELOW_THR",
+                    "t=%.3fs peak=%.0f median=%.0f ratio=%.1f (need 3.0×)"
+                        .format(audioTime, peak, median, peak / maxOf(median, 1.0)))
+            }
+            return false
+        }
 
         var peakFrame = 0
         for (f in 1 until windowFrames) {
             if (energy[f] > energy[peakFrame]) peakFrame = f
         }
 
-        val threshold = median + (peak - median) * 0.3
+        val threshold = median + (peak - median) * 0.5
 
-        var loudCount = 0
-        for (f in 0 until windowFrames) {
-            if (energy[f] > threshold) loudCount++
-        }
-        if (loudCount > 2) return false
-
+        // Expand outward from peak to find the contiguous streak of loud frames
         var spikeStart = peakFrame
         var spikeEnd = peakFrame
-        if (peakFrame > 0 && energy[peakFrame - 1] > threshold) spikeStart = peakFrame - 1
-        if (peakFrame < windowFrames - 1 && energy[peakFrame + 1] > threshold) spikeEnd = peakFrame + 1
+        while (spikeStart > 0 && energy[spikeStart - 1] > threshold) spikeStart--
+        while (spikeEnd < windowFrames - 1 && energy[spikeEnd + 1] > threshold) spikeEnd++
 
-        // Strict silence on both sides (3-frame overlap guarantees interior)
-        if (spikeStart < 1 || spikeEnd > windowFrames - 2) return false
-        if (energy[spikeStart - 1] >= threshold) return false
-        if (energy[spikeEnd + 1] >= threshold) return false
-
+        val streakLen = spikeEnd - spikeStart + 1
         val globalFrame = energyCount - windowFrames + peakFrame
-        if (globalFrame - lastBeatFrame < minBeatGapFrames) return false
+        val audioTime = totalSamples.toDouble() / sampleRate
+
+        if (streakLen > 5) {
+            logger?.log("SPIKE_TOO_WIDE",
+                "t=%.3fs peak=%.0f streak=%d frames (%dms) global_frame=%d"
+                    .format(audioTime, peak, streakLen, streakLen * 5, globalFrame))
+            return false
+        }
+
+        // Require quiet frames on both sides of the streak (12-frame overlap guarantees interior)
+        if (spikeStart < 1 || spikeEnd > windowFrames - 2) {
+            logger?.log("SPIKE_AT_EDGE",
+                "t=%.3fs peak=%.0f spikeStart=%d spikeEnd=%d global_frame=%d"
+                    .format(audioTime, peak, spikeStart, spikeEnd, globalFrame))
+            return false
+        }
+        if (energy[spikeStart - 1] >= threshold || energy[spikeEnd + 1] >= threshold) {
+            logger?.log("SPIKE_NOT_ISOLATED",
+                "t=%.3fs peak=%.0f threshold=%.0f left=%.0f right=%.0f global_frame=%d"
+                    .format(audioTime, peak, threshold, energy[spikeStart - 1], energy[spikeEnd + 1], globalFrame))
+            return false
+        }
+
+        if (globalFrame - lastBeatFrame < minBeatGapFrames) {
+            val gapMs = (globalFrame - lastBeatFrame) * frameSamples * 1000 / sampleRate
+            logger?.log("SPIKE_DEAD_ZONE",
+                "t=%.3fs peak=%.0f gap=%dms (need %dms) global_frame=%d"
+                    .format(audioTime, peak, gapMs,
+                        minBeatGapFrames * frameSamples * 1000 / sampleRate, globalFrame))
+            return false
+        }
 
         beatCount++
         lastBeatIsTick = (beatCount % 2 == 1)
         if (lastBeatIsTick) tickCount++
+        val prevBeatFrame = lastBeatFrame
         lastBeatFrame = globalFrame
 
-        val windowBase = energyCount - windowFrames
-        for (f in spikeStart..spikeEnd) {
-            val gf = windowBase + f
-            if (gf in 0 until energyCount) {
-                beatSignal[gf] = minOf(energyData[gf], energyCap)
-            }
-        }
+        beatFrames.add(globalFrame)
+
+        val beatType = if (lastBeatIsTick) "TICK" else "TOCK"
+        val gapFromPrev = if (prevBeatFrame >= 0) {
+            val gapMs = (globalFrame - prevBeatFrame) * frameSamples * 1000.0 / sampleRate
+            "gap=%.0fms".format(gapMs)
+        } else "gap=N/A"
+        logger?.log("BEAT",
+            "#%d %s t=%.3fs peak=%.0f median=%.0f ratio=%.1f streak=%d %s global_frame=%d"
+                .format(beatCount, beatType, audioTime, peak, median,
+                    peak / maxOf(median, 1.0), streakLen, gapFromPrev, globalFrame))
+
         return true
     }
 
     // ================================================================
-    //  Autocorrelation period estimation
+    //  Period estimation: histogram of deltas + least-squares best fit
     // ================================================================
 
-    private fun estimatePeriodFromAC() {
-        val n = energyCount
-        val acMinLag = 10
-        val searchMinLag = 20
-        val maxLag = minOf(n / 3, 200)
-        if (maxLag <= searchMinLag + 2) return
+    private fun estimatePeriod() {
+        val n = beatFrames.size
+        if (n < 4) return
 
-        var mean = 0.0
-        for (i in 0 until n) mean += beatSignal[i]
-        mean /= n
+        // Step 1: consecutive beat-to-beat deltas (in 5ms frames)
+        val deltas = IntArray(n - 1) { beatFrames[it + 1] - beatFrames[it] }
 
-        val acf = DoubleArray(maxLag + 1)
-        for (lag in acMinLag..maxLag) {
-            var sum = 0.0
-            for (i in 0 until n - lag) {
-                sum += (beatSignal[i] - mean) * (beatSignal[i + lag] - mean)
+        // Step 2: histogram — count occurrences of each delta value
+        val histogram = mutableMapOf<Int, Int>()
+        for (d in deltas) {
+            histogram[d] = (histogram[d] ?: 0) + 1
+        }
+
+        // Group adjacent delta values (within 2 frames = 10ms) into clusters
+        val sortedKeys = histogram.keys.sorted()
+        if (sortedKeys.isEmpty()) return
+
+        data class Cluster(val keys: MutableList<Int> = mutableListOf(), var count: Int = 0)
+        val clusters = mutableListOf<Cluster>()
+        var cur = Cluster()
+        for (key in sortedKeys) {
+            if (cur.keys.isNotEmpty() && key - cur.keys.last() > 2) {
+                clusters.add(cur)
+                cur = Cluster()
             }
-            acf[lag] = sum / (n - lag)
+            cur.keys.add(key)
+            cur.count += histogram[key]!!
         }
+        clusters.add(cur)
+        clusters.sortByDescending { it.count }
 
-        // Find the maximum ACF value for the significance threshold
-        var maxAcf = 0.0
-        for (lag in searchMinLag..maxLag) {
-            if (acf[lag] > maxAcf) maxAcf = acf[lag]
-        }
-        if (maxAcf <= 0) return
-        val peakThreshold = maxAcf * 0.1
-
-        // Find the FIRST significant peak. This is the fundamental
-        // (beat-to-beat) period. Using "global max" is wrong because
-        // higher harmonics of the beat pattern can have stronger ACF
-        // values due to unbiased normalization and edge effects.
-        var firstPeak = -1
-        for (lag in searchMinLag + 1 until maxLag) {
-            if (acf[lag] > acf[lag - 1] && acf[lag] >= acf[lag + 1] && acf[lag] > peakThreshold) {
-                firstPeak = lag
-                break
+        // Weighted centre of a cluster
+        fun clusterCenter(c: Cluster): Double {
+            var sum = 0.0; var cnt = 0
+            for (k in c.keys) {
+                val w = histogram[k]!!
+                sum += k.toDouble() * w
+                cnt += w
             }
+            return sum / cnt
         }
-        if (firstPeak < 0) return
 
-        // Tick-to-tick = 2× beat-to-beat. Find the actual ACF peak
-        // nearest to 2× the fundamental for parabolic refinement.
-        val dblTarget = firstPeak * 2
-        val tickToTickLag: Int
-        if (dblTarget + 1 <= maxLag) {
-            val lo = maxOf(searchMinLag, dblTarget - 5)
-            val hi = minOf(maxLag, dblTarget + 5)
-            var best = lo
-            for (lag in lo..hi) if (acf[lag] > acf[best]) best = lag
-            tickToTickLag = best
+        // Determine if we have 1 or 2 peaks
+        val twoPeaks = clusters.size >= 2 && clusters[1].count >= 2
+        val c1 = clusterCenter(clusters[0])
+        val histPeriodFrames: Double
+        val halfPeriodCenters: List<Double>
+
+        if (twoPeaks) {
+            // Two peaks visible — need ≥ 3 items in each before reporting
+            if (clusters[0].count < 3 || clusters[1].count < 3) return
+            val c2 = clusterCenter(clusters[1])
+            histPeriodFrames = c1 + c2
+            halfPeriodCenters = listOf(c1, c2)
+
+            logger?.log("HISTOGRAM",
+                "deltas=%d 2-peak period=%.1f frames (%.0fµs) p1=%.1f(%d) p2=%.1f(%d)"
+                    .format(deltas.size, histPeriodFrames,
+                        histPeriodFrames * frameSamples.toDouble() / sampleRate * 1_000_000.0,
+                        c1, clusters[0].count, c2, clusters[1].count))
         } else {
-            // 2× out of range — refine the fundamental and double it
-            val refined = parabolicRefineACF(acf, firstPeak, acMinLag, maxLag) * 2.0
-            updatePeriod(refined * frameSamples.toDouble() / sampleRate * 1_000_000.0)
-            return
+            // One peak — need ≥ 6 items
+            if (clusters[0].count < 6) return
+            histPeriodFrames = c1 * 2.0
+            halfPeriodCenters = listOf(c1)
+
+            logger?.log("HISTOGRAM",
+                "deltas=%d 1-peak period=%.1f frames (%.0fµs) center=%.1f(%d)"
+                    .format(deltas.size, histPeriodFrames,
+                        histPeriodFrames * frameSamples.toDouble() / sampleRate * 1_000_000.0,
+                        c1, clusters[0].count))
         }
 
-        val refined = parabolicRefineACF(acf, tickToTickLag, acMinLag, maxLag)
-        updatePeriod(refined * frameSamples.toDouble() / sampleRate * 1_000_000.0)
+        val framesToMicros = frameSamples.toDouble() / sampleRate * 1_000_000.0
+        periodMicros = histPeriodFrames * framesToMicros
+        method = Method.HISTOGRAM
+        uncertaintyMicros = 0.0
+        synced = false
+
+        // Step 3: pair-based best-fit for sub-frame precision
+        if (n >= 8) {
+            val halfMin = halfPeriodCenters.min() - 10
+            val halfMax = halfPeriodCenters.max() + 10
+            bestFitPeriod(histPeriodFrames, halfMin, halfMax)
+        }
     }
 
-    private fun updatePeriod(newPeriodMicros: Double) {
-        periodMicros = newPeriodMicros
-        method = Method.AUTOCORRELATION
+    /**
+     * Pair-based least-squares fit for the full tick-to-tick period.
+     *
+     * Groups consecutive detected beats into pairs where the gap matches
+     * a known half-period (from the histogram). Each pair represents one
+     * tick-tock or tock-tick unit. The period is how often these pairs
+     * repeat. This is robust to missed beats: a missed beat simply means
+     * a pair doesn't form, without corrupting the indices of other pairs.
+     *
+     * Uses the histogram's approximate period to assign integer indices
+     * to each pair, then fits pairPos[j] = t0 + index[j] * P via linear
+     * regression. The long baseline between early and late pairs recovers
+     * sub-frame precision from accumulated drift.
+     */
+    private fun bestFitPeriod(
+        approxPeriodFrames: Double,
+        halfPeriodMin: Double,
+        halfPeriodMax: Double,
+    ) {
+        val n = beatFrames.size
 
-        recentPeriods.addLast(newPeriodMicros)
-        if (recentPeriods.size > maxRecentPeriods) recentPeriods.removeFirst()
-
-        if (recentPeriods.size >= 5) {
-            val avg = recentPeriods.average()
-            var varSum = 0.0
-            for (p in recentPeriods) varSum += (p - avg) * (p - avg)
-            val std = sqrt(varSum / (recentPeriods.size - 1))
-            uncertaintyMicros = 3.0 * std / sqrt(recentPeriods.size.toDouble())
-            synced = std < periodMicros * 0.001
+        // Step 1: form pairs — consecutive beats with a valid half-period gap
+        val pairPositions = mutableListOf<Int>()
+        var i = 0
+        while (i < n - 1) {
+            val delta = beatFrames[i + 1] - beatFrames[i]
+            if (delta >= halfPeriodMin && delta <= halfPeriodMax) {
+                pairPositions.add(beatFrames[i])
+                i += 2
+            } else {
+                i += 1
+            }
         }
+
+        if (pairPositions.size < 4) return
+
+        // Step 2: assign period indices using approximate period
+        val m = pairPositions.size
+        val indices = IntArray(m)
+        for (j in 1 until m) {
+            indices[j] = ((pairPositions[j] - pairPositions[0]).toDouble()
+                / approxPeriodFrames).roundToInt()
+        }
+
+        // Step 3: linear regression — pairPos[j] = t0 + indices[j] * P
+        var sk = 0.0; var skk = 0.0; var sp = 0.0; var skp = 0.0
+        for (j in 0 until m) {
+            val k = indices[j].toDouble()
+            val p = pairPositions[j].toDouble()
+            sk += k; skk += k * k; sp += p; skp += k * p
+        }
+
+        val det = m.toDouble() * skk - sk * sk
+        if (abs(det) < 1e-12) return
+
+        val t0 = (skk * sp - sk * skp) / det
+        val period = (m.toDouble() * skp - sk * sp) / det
+        if (period <= 0) return
+
+        // Residuals and uncertainty
+        var sumResidualSq = 0.0
+        for (j in 0 until m) {
+            val expected = t0 + indices[j] * period
+            val residual = pairPositions[j].toDouble() - expected
+            sumResidualSq += residual * residual
+        }
+
+        val sigma2 = if (m > 2) sumResidualSq / (m - 2) else 0.0
+        // var(P) = σ² · N / det  where det = N·Σk² − (Σk)²
+        val periodVariance = if (abs(det) > 1e-20 && m > 2) m.toDouble() / det * sigma2 else 0.0
+
+        val framesToMicros = frameSamples.toDouble() / sampleRate * 1_000_000.0
+        periodMicros = period * framesToMicros
+        uncertaintyMicros = if (periodVariance > 0) sqrt(periodVariance) * framesToMicros else 0.0
+        method = Method.BEST_FIT
+
+        val rmsResidual = if (m > 2) sqrt(sigma2) else 0.0
+        synced = uncertaintyMicros > 0 && uncertaintyMicros < periodMicros * 0.001
+
+        logger?.log("BEST_FIT",
+            "period=%.2f frames (%.1fµs ±%.1fµs) pairs=%d rms=%.2f synced=%s"
+                .format(period, periodMicros, uncertaintyMicros, m, rmsResidual, synced))
     }
 
     // ================================================================
     //  Helpers
     // ================================================================
-
-    private fun parabolicRefineACF(acf: DoubleArray, peak: Int, minIdx: Int, maxIdx: Int): Double {
-        if (peak <= minIdx || peak >= maxIdx) return peak.toDouble()
-        val ym1 = acf[peak - 1]; val y0 = acf[peak]; val yp1 = acf[peak + 1]
-        val denom = 2.0 * (2.0 * y0 - yp1 - ym1)
-        return if (denom != 0.0) peak + (yp1 - ym1) / denom else peak.toDouble()
-    }
-
-    private fun parabolicRefineArray(arr: DoubleArray, peak: Int): Double {
-        if (peak <= 0 || peak >= arr.size - 1) return peak.toDouble()
-        val ym1 = arr[peak - 1]; val y0 = arr[peak]; val yp1 = arr[peak + 1]
-        val denom = 2.0 * (2.0 * y0 - yp1 - ym1)
-        return if (denom != 0.0) peak + (yp1 - ym1) / denom else peak.toDouble()
-    }
 
     private fun readWav(file: File): ShortArray? {
         return try {
