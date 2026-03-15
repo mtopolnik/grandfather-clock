@@ -14,26 +14,27 @@ import kotlin.math.sqrt
 /**
  * Detects tick/tock beats from PCM audio and measures the pendulum period.
  *
- * Two-phase approach:
- * 1. Real-time: sliding 200ms window with 140ms advance, 5ms FFT frames.
- *    Each frame is analysed via FFT and the high-frequency band energy
- *    (≥ 2 kHz) is used for beat detection. Clock ticks are broadband
- *    transients that light up the full spectrum, while background noise
- *    (voice, handling) is concentrated below 2 kHz, giving a typical
- *    tick/noise ratio of 15–30× (vs 2–3× with plain RMS).
+ * Processes audio one 5 ms frame at a time:
+ * 1. Each frame's high-frequency energy (>= 2 kHz via FFT) is computed and
+ *    stored in a 40-frame (200 ms) ring buffer.
+ * 2. After every new frame, the ring buffer is examined for an isolated
+ *    energy spike (beat). This gives ~5-10 ms detection latency.
  *
  *    Period estimation from detected beats:
  *    a. Histogram of consecutive beat-frame deltas finds 1 or 2 peaks
  *       (tick-to-tock and tock-to-tick intervals). The sum of the peak
- *       centres gives the full tick-to-tick period. Requires ≥ 6 total
- *       items in the identified peak buckets (≥ 3 per peak if two peaks).
+ *       centres gives the full tick-to-tick period. Requires >= 6 total
+ *       items in the identified peak buckets (>= 3 per peak if two peaks).
  *    b. Best-fit: models beat[i] = t0 + (i%2)*T1 + (i/2)*P and solves
  *       for P via least squares across all detected beats. Exploits the
  *       long baseline to recover sub-frame precision from accumulated
  *       drift (the true period is not an exact multiple of 5 ms).
  *
- * 2. WAV refinement: sample-level template matching on the full recording,
- *    searching ±20 ms around the approximate period for maximum precision.
+ * 3. WAV refinement: sample-level template matching on the full recording,
+ *    searching +/-20 ms around the approximate period for maximum precision.
+ *
+ * Clock 1: 1481.5 ms
+ * Clock 2: 1153.5 ms
  */
 class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
 
@@ -47,40 +48,40 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
         val tickCount: Int = 0,
         val beatCount: Int = 0,
         val lastBeatIsTick: Boolean = true,
-        /** True only on the window where a new beat was detected. */
+        /** True only on the frame where a new beat was detected. */
         val newBeat: Boolean = false,
         val elapsedSamples: Long = 0,
         val synced: Boolean = false,
         val method: Method = Method.NONE,
     )
 
-    // ---- Frame / window geometry ----
+    // ---- Frame geometry ----
     private val frameSamples = sampleRate / 200              // 5 ms = 220 @ 44 100
-    private val windowFrames = 40                            // 200 ms
-    private val slideFrames = 28                             // 140 ms
-    private val overlapFrames = windowFrames - slideFrames   // 12 frames = 60 ms
-    private val windowSamples = frameSamples * windowFrames
-    private val slideSamples = frameSamples * slideFrames
-    private val initialMinBeatGapFrames = 80                  // 400 ms between beats
+    private val windowFrames = 40                            // 200 ms energy window
+    private val initialMinBeatGapFrames = 80                 // 400 ms between beats
     private var minBeatGapFrames = initialMinBeatGapFrames
 
     // ---- FFT for high-frequency energy ----
-    private val fftSize = 256                                // next power-of-2 ≥ frameSamples
+    private val fftSize = 256                                // next power-of-2 >= frameSamples
     private val hannWindow = DoubleArray(frameSamples) {
         0.5 * (1 - cos(2.0 * PI * it / (frameSamples - 1)))
     }
     private val fftBuf = DoubleArray(fftSize * 2)            // interleaved [re, im]
-    private val hfStartBin = (2000.0 * fftSize / sampleRate).toInt() + 1  // first bin ≥ 2 kHz
+    private val hfStartBin = (2000.0 * fftSize / sampleRate).toInt() + 1  // first bin >= 2 kHz
     private val hfBinCount = fftSize / 2 + 1 - hfStartBin
 
-    // ---- Sample accumulation ----
-    private val sampleBuffer = ShortArray(windowSamples)
-    private var samplesInBuffer = 0
+    // ---- Sample accumulation (one frame only) ----
+    private val frameBuffer = ShortArray(frameSamples)
+    private var samplesInFrame = 0
     private var totalSamples: Long = 0
 
-    // ---- Frame counter (for global frame indexing) ----
+    // ---- Energy ring buffer ----
+    private val energyRing = DoubleArray(windowFrames)
+    private var energyHead = 0       // next write position
+    private var energyFilled = 0     // valid entries (grows to windowFrames)
+
+    // ---- Frame counter (global) ----
     private var energyCount = 0
-    private var isFirstWindow = true
 
     // ---- Beat detection ----
     private var beatCount = 0
@@ -98,7 +99,8 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
     private var synced = false
 
     private var estimateCounter = 0
-    private val estimateInterval = 6  // ~once per second (6 windows × 140ms ≈ 840ms)
+    private val estimateInterval = 168  // ~once per second (168 x 5 ms = 840 ms)
+    private val stateInterval = 28      // periodic State for UI (~140 ms)
 
     // ================================================================
     //  Public API
@@ -110,20 +112,28 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
         var pos = bufferOffset
         val end = bufferOffset + count
         var result: State? = null
+        var beatInBuffer = false
 
         while (pos < end) {
-            val toCopy = minOf(windowSamples - samplesInBuffer, end - pos)
-            System.arraycopy(buffer, pos, sampleBuffer, samplesInBuffer, toCopy)
-            samplesInBuffer += toCopy
+            val toCopy = minOf(frameSamples - samplesInFrame, end - pos)
+            System.arraycopy(buffer, pos, frameBuffer, samplesInFrame, toCopy)
+            samplesInFrame += toCopy
             pos += toCopy
             totalSamples += toCopy
 
-            if (samplesInBuffer >= windowSamples) {
-                result = analyzeWindow()
-                val keep = windowSamples - slideSamples
-                System.arraycopy(sampleBuffer, slideSamples, sampleBuffer, 0, keep)
-                samplesInBuffer = keep
+            if (samplesInFrame >= frameSamples) {
+                val s = processFrame()
+                if (s != null) {
+                    if (s.newBeat) beatInBuffer = true
+                    result = s
+                }
+                samplesInFrame = 0
             }
+        }
+        // If a beat was detected in an earlier frame but a later periodic State
+        // overwrote it, re-set newBeat so the UI doesn't miss the flash.
+        if (beatInBuffer && result != null && !result.newBeat) {
+            result = result.copy(newBeat = true)
         }
         return result
     }
@@ -297,10 +307,11 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
     }
 
     fun reset() {
-        samplesInBuffer = 0
+        samplesInFrame = 0
         totalSamples = 0
         energyCount = 0
-        isFirstWindow = true
+        energyHead = 0
+        energyFilled = 0
         beatCount = 0
         tickCount = 0
         lastBeatIsTick = true
@@ -315,49 +326,60 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
     }
 
     // ================================================================
-    //  Window analysis
+    //  Per-frame processing
     // ================================================================
 
-    private fun analyzeWindow(): State {
-        // Compute high-frequency energy for each 5 ms frame via FFT
-        val frameEnergy = DoubleArray(windowFrames) { f ->
-            computeHfEnergy(f * frameSamples)
+    private fun processFrame(): State? {
+        // Compute HF energy for this single 5 ms frame
+        val energy = computeHfEnergy()
+
+        // Store in ring buffer
+        energyRing[energyHead] = energy
+        energyHead = (energyHead + 1) % windowFrames
+        if (energyFilled < windowFrames) energyFilled++
+        energyCount++
+
+        // Beat detection once ring buffer is full
+        var newBeat = false
+        if (energyFilled >= windowFrames) {
+            newBeat = detectSpike()
         }
 
-        // Advance global frame counter
-        energyCount += if (isFirstWindow) windowFrames else slideFrames
-        isFirstWindow = false
-
-        val newBeat = detectSpike(frameEnergy)
-
+        // Period estimation (~once per second)
+        var periodUpdated = false
         estimateCounter++
         if (estimateCounter >= estimateInterval && beatFrames.size >= 4) {
             estimateCounter = 0
             estimatePeriod()
+            periodUpdated = true
         }
 
-        return State(
-            periodMicros = periodMicros,
-            uncertaintyMicros = uncertaintyMicros,
-            tickCount = tickCount,
-            beatCount = beatCount,
-            lastBeatIsTick = lastBeatIsTick,
-            newBeat = newBeat,
-            elapsedSamples = totalSamples,
-            synced = synced,
-            method = method,
-        )
+        // Return State on beat, period update, or periodically for elapsed time
+        if (newBeat || periodUpdated || energyCount % stateInterval == 0) {
+            return State(
+                periodMicros = periodMicros,
+                uncertaintyMicros = uncertaintyMicros,
+                tickCount = tickCount,
+                beatCount = beatCount,
+                lastBeatIsTick = lastBeatIsTick,
+                newBeat = newBeat,
+                elapsedSamples = totalSamples,
+                synced = synced,
+                method = method,
+            )
+        }
+        return null
     }
 
     /**
-     * Compute the RMS energy of frequency bins ≥ 2 kHz for one frame.
-     * [frameOffset] is the index into [sampleBuffer].
+     * Compute the RMS energy of frequency bins >= 2 kHz for the current frame
+     * in [frameBuffer].
      */
-    private fun computeHfEnergy(frameOffset: Int): Double {
+    private fun computeHfEnergy(): Double {
         // Zero the buffer, then copy windowed samples into real part
         for (i in fftBuf.indices) fftBuf[i] = 0.0
         for (i in 0 until frameSamples) {
-            fftBuf[2 * i] = sampleBuffer[frameOffset + i].toDouble() * hannWindow[i]
+            fftBuf[2 * i] = frameBuffer[i].toDouble() * hannWindow[i]
         }
         fft(fftBuf, fftSize)
 
@@ -374,17 +396,22 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
     //  Spike (beat) detection
     // ================================================================
 
-    private fun detectSpike(energy: DoubleArray): Boolean {
+    private fun detectSpike(): Boolean {
+        // Linearize ring buffer: oldest at index 0, newest at windowFrames-1
+        val energy = DoubleArray(windowFrames) { i ->
+            energyRing[(energyHead + i) % windowFrames]
+        }
+
         val sorted = energy.copyOf().also { it.sort() }
         val median = sorted[windowFrames / 2]
         val peak = energy.max()
 
-        // HF energy gives 15–30× tick/noise ratio; 3× is a safe pre-filter
+        // HF energy gives 15-30x tick/noise ratio; 3x is a safe pre-filter
         if (peak < median * 3.0 || peak < 1000.0) {
-            if (peak > median * 1.5 && peak > 500.0) {
+            if (peak > median * 1.5 && peak > 500.0 && energy[windowFrames - 1] == peak) {
                 val audioTime = totalSamples.toDouble() / sampleRate
                 logger?.log("SPIKE_BELOW_THR",
-                    "t=%.3fs peak=%.0f median=%.0f ratio=%.1f (need 3.0×)"
+                    "t=%.3fs peak=%.0f median=%.0f ratio=%.1f (need 3.0x)"
                         .format(audioTime, peak, median, peak / maxOf(median, 1.0)))
             }
             return false
@@ -408,32 +435,23 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
         val audioTime = totalSamples.toDouble() / sampleRate
 
         if (streakLen > 5) {
-            logger?.log("SPIKE_TOO_WIDE",
-                "t=%.3fs peak=%.0f streak=%d frames (%dms) global_frame=%d"
-                    .format(audioTime, peak, streakLen, streakLen * 5, globalFrame))
+            if (energy[windowFrames - 1] == peak) {
+                logger?.log("SPIKE_TOO_WIDE",
+                    "t=%.3fs peak=%.0f streak=%d frames (%dms) global_frame=%d"
+                        .format(audioTime, peak, streakLen, streakLen * 5, globalFrame))
+            }
             return false
         }
 
-        // Require quiet frames on both sides of the streak (12-frame overlap guarantees interior)
+        // Require quiet frames on both sides of the streak
         if (spikeStart < 1 || spikeEnd > windowFrames - 2) {
-            logger?.log("SPIKE_AT_EDGE",
-                "t=%.3fs peak=%.0f spikeStart=%d spikeEnd=%d global_frame=%d"
-                    .format(audioTime, peak, spikeStart, spikeEnd, globalFrame))
             return false
         }
         if (energy[spikeStart - 1] >= threshold || energy[spikeEnd + 1] >= threshold) {
-            logger?.log("SPIKE_NOT_ISOLATED",
-                "t=%.3fs peak=%.0f threshold=%.0f left=%.0f right=%.0f global_frame=%d"
-                    .format(audioTime, peak, threshold, energy[spikeStart - 1], energy[spikeEnd + 1], globalFrame))
             return false
         }
 
         if (globalFrame - lastBeatFrame < minBeatGapFrames) {
-            val gapMs = (globalFrame - lastBeatFrame) * frameSamples * 1000 / sampleRate
-            logger?.log("SPIKE_DEAD_ZONE",
-                "t=%.3fs peak=%.0f gap=%dms (need %dms) global_frame=%d"
-                    .format(audioTime, peak, gapMs,
-                        minBeatGapFrames * frameSamples * 1000 / sampleRate, globalFrame))
             return false
         }
 
@@ -511,7 +529,7 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
         val halfPeriodCenters: List<Double>
 
         if (twoPeaks) {
-            // Two peaks visible — need ≥ 3 items in each before reporting
+            // Two peaks visible — need >= 3 items in each before reporting
             if (clusters[0].count < 3 || clusters[1].count < 3) return
             val c2 = clusterCenter(clusters[1])
             histPeriodFrames = c1 + c2
@@ -523,7 +541,7 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
                         histPeriodFrames * frameSamples.toDouble() / sampleRate * 1_000_000.0,
                         c1, clusters[0].count, c2, clusters[1].count))
         } else {
-            // One peak — need ≥ 6 items
+            // One peak — need >= 6 items
             if (clusters[0].count < 6) return
             histPeriodFrames = c1 * 2.0
             halfPeriodCenters = listOf(c1)

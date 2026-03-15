@@ -1,5 +1,7 @@
 package com.example.grandfatherclock.ui
 
+import android.view.OrientationEventListener
+import android.view.Surface
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
@@ -17,9 +19,10 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
+import androidx.compose.material3.Surface as M3Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -29,7 +32,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -42,6 +47,34 @@ import kotlinx.coroutines.delay
 import java.text.NumberFormat
 import java.util.Locale
 
+/**
+ * Returns true when the device is physically held upside-down (reverse portrait)
+ * but the system display has not rotated to match (i.e. still showing ROTATION_0).
+ * In that case the UI content should be rotated 180 degrees so the user can read it.
+ */
+@Composable
+private fun rememberIsUpsideDown(): Boolean {
+    val context = LocalContext.current
+    var isUpsideDown by remember { mutableStateOf(false) }
+
+    DisposableEffect(context) {
+        val listener = object : OrientationEventListener(context) {
+            override fun onOrientationChanged(orientation: Int) {
+                if (orientation == ORIENTATION_UNKNOWN) return
+                val physicallyFlipped = orientation in 135..225
+                // Only flip our content if the system hasn't already rotated the display
+                @Suppress("DEPRECATION")
+                val displayRotation = context.display?.rotation ?: Surface.ROTATION_0
+                isUpsideDown = physicallyFlipped && displayRotation == Surface.ROTATION_0
+            }
+        }
+        listener.enable()
+        onDispose { listener.disable() }
+    }
+
+    return isUpsideDown
+}
+
 @Composable
 fun ClockTunerScreen(
     viewModel: MainViewModel,
@@ -49,14 +82,16 @@ fun ClockTunerScreen(
     onRequestPermission: () -> Unit,
 ) {
     val state by viewModel.state.collectAsState()
+    val isUpsideDown = rememberIsUpsideDown()
 
-    Surface(
+    M3Surface(
         modifier = Modifier.fillMaxSize(),
         color = MaterialTheme.colorScheme.background,
     ) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
+                .rotate(if (isUpsideDown) 180f else 0f)
                 .padding(32.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center,
