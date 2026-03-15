@@ -288,6 +288,92 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
             "period=%.3f samples (%.1fµs ±%.1fµs) pairs=%d rms=%.2f"
                 .format(period, wavPeriod, wavUncertainty, m, rmsResidual))
 
+        // --- Phase 5: Write idealized tick-tock WAV ---
+
+        // Build raw-signal templates by summing all sub-sample-aligned windows.
+        // Alignment uses the diff-domain template (sharpest features) with
+        // parabolic interpolation for fractional-sample precision, then
+        // windowed sinc interpolation to extract raw samples at the exact
+        // fractional position.  The DoubleArray accumulator has no clipping
+        // risk; the final result is normalized to 90% of 16-bit max.
+        val amplitudeThreshold = 0.9 * 32767
+        val sincHalfLen = 8  // 8-tap half-width for windowed sinc kernel
+        val refineRange = 3  // ±3 samples for sub-sample refinement
+
+        fun buildRawTemplate(positions: DoubleArray, diffTpl: DoubleArray): ShortArray {
+            val tpl = DoubleArray(tplWidth)
+            for (k in positions.indices) {
+                val center = positions[k].roundToInt()
+
+                // Cross-correlate diff signal with diff template over ±refineRange
+                val xcorr = DoubleArray(2 * refineRange + 1)
+                for (off in -refineRange..refineRange) {
+                    var dot = 0.0
+                    for (j in 0 until tplWidth) {
+                        val pos = center - tplHalf + off + j
+                        if (pos in 0 until n) dot += diffTpl[j] * diff[pos]
+                    }
+                    xcorr[off + refineRange] = dot
+                }
+
+                // Find integer peak
+                var bestIdx = refineRange
+                for (i in xcorr.indices) {
+                    if (xcorr[i] > xcorr[bestIdx]) bestIdx = i
+                }
+                val bestOff = bestIdx - refineRange
+
+                // Parabolic interpolation for fractional offset
+                val fracOff = if (bestIdx in 1 until xcorr.size - 1) {
+                    val a = xcorr[bestIdx - 1]
+                    val b = xcorr[bestIdx]
+                    val c = xcorr[bestIdx + 1]
+                    val d = a - 2.0 * b + c
+                    if (abs(d) > 1e-10) (0.5 * (a - c) / d).coerceIn(-0.5, 0.5) else 0.0
+                } else 0.0
+
+                // Extract raw samples with windowed sinc interpolation
+                for (j in 0 until tplWidth) {
+                    var sample = 0.0
+                    val intPos = center - tplHalf + bestOff + j
+                    for (t in -sincHalfLen..sincHalfLen) {
+                        val pos = intPos + t
+                        if (pos in 0 until n) {
+                            val x = t.toDouble() - fracOff
+                            val sincVal = if (abs(x) < 1e-10) 1.0
+                                else sin(PI * x) / (PI * x)
+                            val win = 0.5 * (1.0 + cos(PI * x / sincHalfLen))
+                            sample += rawSamples[pos].toDouble() * sincVal * win
+                        }
+                    }
+                    tpl[j] += sample
+                }
+            }
+            // Normalize to 90% of max to avoid clipping
+            val peak = tpl.maxOf { abs(it) }
+            val scale = if (peak > 0.0) amplitudeThreshold / peak else 1.0
+            return ShortArray(tplWidth) { (tpl[it] * scale).roundToInt().coerceIn(-32768, 32767).toShort() }
+        }
+
+        val rawTickTemplate = buildRawTemplate(preciseA, templateA)
+        val rawTockTemplate = buildRawTemplate(preciseB, templateB)
+
+        // Silence durations: beat-to-beat gap minus template width
+        val tickToTockSamples = (0 until m).map { preciseB[it] - preciseA[it] }.average()
+        val tockToTickSamples = period - tickToTockSamples
+        val silenceAfterTick = maxOf(0, (tickToTockSamples - tplWidth).roundToInt())
+        val silenceAfterTock = maxOf(0, (tockToTickSamples - tplWidth).roundToInt())
+
+        val idealizedFile = File(wavFile.parent, "clock_idealized.wav")
+        writeIdealizedWav(idealizedFile, rawTickTemplate, rawTockTemplate,
+            silenceAfterTick, silenceAfterTock)
+
+        logger?.log("IDEALIZED_WAV",
+            "written to %s tick=%d tock=%d silenceAfterTick=%d silenceAfterTock=%d total=%d samples"
+                .format(idealizedFile.absolutePath, rawTickTemplate.size, rawTockTemplate.size,
+                    silenceAfterTick, silenceAfterTock,
+                    rawTickTemplate.size + silenceAfterTick + rawTockTemplate.size + silenceAfterTock))
+
         periodMicros = wavPeriod
         uncertaintyMicros = wavUncertainty
         method = Method.WAV_REFINED
@@ -666,6 +752,49 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
     // ================================================================
     //  Helpers
     // ================================================================
+
+    private fun writeIdealizedWav(
+        file: File,
+        tick: ShortArray,
+        tock: ShortArray,
+        silenceAfterTick: Int,
+        silenceAfterTock: Int,
+    ) {
+        val repeats = 10
+        val cycleSamples = tick.size + silenceAfterTick + tock.size + silenceAfterTock
+        val totalSamples = cycleSamples * repeats
+        val samples = ShortArray(totalSamples)
+        for (r in 0 until repeats) {
+            var pos = r * cycleSamples
+            tick.copyInto(samples, pos); pos += tick.size
+            pos += silenceAfterTick  // silence: already zero
+            tock.copyInto(samples, pos)
+        }
+
+        val dataSize = totalSamples * 2
+        RandomAccessFile(file, "rw").use { raf ->
+            raf.setLength(0)
+            val header = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN)
+            header.put("RIFF".toByteArray())
+            header.putInt(36 + dataSize)
+            header.put("WAVE".toByteArray())
+            header.put("fmt ".toByteArray())
+            header.putInt(16)              // subchunk1 size
+            header.putShort(1)             // PCM format
+            header.putShort(1)             // mono
+            header.putInt(sampleRate)
+            header.putInt(sampleRate * 2)  // byte rate
+            header.putShort(2)             // block align
+            header.putShort(16)            // bits per sample
+            header.put("data".toByteArray())
+            header.putInt(dataSize)
+            raf.write(header.array())
+
+            val data = ByteBuffer.allocate(dataSize).order(ByteOrder.LITTLE_ENDIAN)
+            for (s in samples) data.putShort(s)
+            raf.write(data.array())
+        }
+    }
 
     private fun readWav(file: File): ShortArray? {
         return try {

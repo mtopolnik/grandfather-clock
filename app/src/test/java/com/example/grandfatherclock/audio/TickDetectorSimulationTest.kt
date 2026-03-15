@@ -10,10 +10,17 @@ class TickDetectorSimulationTest {
 
     @Test
     fun simulateFromWav() {
-        val home = System.getProperty("user.home") ?: error("user.home not set")
-        val wavPath = System.getenv("WAV_FILE") ?: "$home/Desktop/clock_recording.wav"
-        val wavFile = File(wavPath)
-        require(wavFile.exists()) { "WAV file not found: $wavPath" }
+        val envPath = System.getenv("WAV_FILE")?.takeIf { it.isNotEmpty() }
+        val projectRoot = System.getProperty("project.root") ?: ""
+        val home = System.getProperty("user.home") ?: ""
+        val candidates = listOfNotNull(
+            envPath,
+            "$projectRoot/clock_recording.wav".takeIf { projectRoot.isNotEmpty() },
+            "$home/Desktop/clock_recording.wav".takeIf { home.isNotEmpty() },
+        )
+        val wavFile = candidates.map { File(it) }.firstOrNull { it.exists() }
+            ?: error("WAV file not found, tried: $candidates")
+        println("Using WAV: ${wavFile.absolutePath}")
 
         val outputDir = wavFile.parentFile!!
         val logger = SessionLogger(outputDir)

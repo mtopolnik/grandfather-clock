@@ -49,6 +49,9 @@ tasks.withType<Test> {
     testLogging {
         showStandardStreams = true
     }
+    // Forward WAV_FILE env var and project root to the test JVM
+    environment("WAV_FILE", System.getenv("WAV_FILE") ?: "")
+    systemProperty("project.root", rootProject.rootDir.absolutePath)
 }
 
 dependencies {
