@@ -141,7 +141,7 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
     fun analyzeWavFile(wavFile: File): State? {
         if (periodMicros <= 0.0 || beatFrames.size < 8) return null
 
-        val rawSamples = readWav(wavFile) ?: return null
+        val (rawSamples, skipSamples) = readWav(wavFile) ?: return null
         val n = rawSamples.size
         if (n < sampleRate * 3) return null
 
@@ -161,10 +161,10 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
         val groupB = mutableListOf<Int>()
         var idx = 0
         while (idx < beatFrames.size - 1) {
-            val posA = beatFrames[idx] * frameSamples
-            val posB = beatFrames[idx + 1] * frameSamples
+            val posA = beatFrames[idx] * frameSamples - skipSamples
+            val posB = beatFrames[idx + 1] * frameSamples - skipSamples
             val gap = posB - posA
-            if (gap >= halfMin && gap <= halfMax) {
+            if (gap >= halfMin && gap <= halfMax && posA >= 0 && posB < n) {
                 groupA.add(posA)
                 groupB.add(posB)
                 idx += 2
@@ -796,18 +796,21 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
         }
     }
 
-    private fun readWav(file: File): ShortArray? {
+    private data class WavData(val samples: ShortArray, val skipSamples: Int)
+
+    private fun readWav(file: File): WavData? {
         return try {
             RandomAccessFile(file, "r").use { raf ->
                 raf.seek(44)
                 val dataBytes = (raf.length() - 44).toInt()
                 val maxBytes = sampleRate * 300 * 2
                 val bytesToRead = minOf(dataBytes, maxBytes)
-                if (dataBytes > maxBytes) raf.seek(44L + dataBytes - maxBytes)
+                val skipSamples = if (dataBytes > maxBytes) (dataBytes - maxBytes) / 2 else 0
+                if (skipSamples > 0) raf.seek(44L + skipSamples * 2L)
                 val bytes = ByteArray(bytesToRead)
                 raf.readFully(bytes)
                 val buf = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
-                ShortArray(bytesToRead / 2) { buf.short }
+                WavData(ShortArray(bytesToRead / 2) { buf.short }, skipSamples)
             }
         } catch (_: Exception) {
             null
