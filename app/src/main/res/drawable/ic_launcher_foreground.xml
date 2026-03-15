@@ -1,0 +1,124 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Clock body (tall case) -->
+    <path
+        android:fillColor="#5D4037"
+        android:pathData="M38,18 L70,18 C72,18 73,19 73,21 L73,28 L75,30 L75,85 L77,87 L77,95 C77,97 76,98 74,98 L34,98 C32,98 31,97 31,95 L31,87 L33,85 L33,30 L35,28 L35,21 C35,19 36,18 38,18 Z" />
+
+    <!-- Clock body highlight (lighter wood tone) -->
+    <path
+        android:fillColor="#795548"
+        android:pathData="M40,20 L68,20 C69.5,20 71,21 71,22.5 L71,27 L73,29 L73,84 L75,86 L75,94 C75,95.5 74,96.5 72.5,96.5 L35.5,96.5 C34,96.5 33,95.5 33,94 L33,86 L35,84 L35,29 L37,27 L37,22.5 C37,21 38.5,20 40,20 Z" />
+
+    <!-- Top ornament (crown) -->
+    <path
+        android:fillColor="#4E342E"
+        android:pathData="M44,18 L44,14 C44,13 45,12 46,12 L50,10 L54,8 L58,10 L62,12 C63,12 64,13 64,14 L64,18 Z" />
+
+    <!-- Finial (top sphere) -->
+    <path
+        android:fillColor="#FFD54F"
+        android:pathData="M54,8 m-3,0 a3,3 0,1 1,6 0 a3,3 0,1 1,-6 0" />
+
+    <!-- Small side finials -->
+    <path
+        android:fillColor="#FFD54F"
+        android:pathData="M44,14 m-2,0 a2,2 0,1 1,4 0 a2,2 0,1 1,-4 0" />
+    <path
+        android:fillColor="#FFD54F"
+        android:pathData="M64,14 m-2,0 a2,2 0,1 1,4 0 a2,2 0,1 1,-4 0" />
+
+    <!-- Clock face circle (outer) -->
+    <path
+        android:fillColor="#FFF8E1"
+        android:pathData="M54,42 m-14,0 a14,14 0,1 1,28 0 a14,14 0,1 1,-28 0" />
+
+    <!-- Clock face ring -->
+    <path
+        android:fillColor="#4E342E"
+        android:strokeWidth="1.5"
+        android:strokeColor="#4E342E"
+        android:fillAlpha="0"
+        android:pathData="M54,42 m-13,0 a13,13 0,1 1,26 0 a13,13 0,1 1,-26 0" />
+
+    <!-- Hour markers -->
+    <path
+        android:fillColor="#4E342E"
+        android:pathData="M53,30 L55,30 L55,33 L53,33 Z" />
+    <path
+        android:fillColor="#4E342E"
+        android:pathData="M53,51 L55,51 L55,54 L53,54 Z" />
+    <path
+        android:fillColor="#4E342E"
+        android:pathData="M66,41 L66,43 L63,43 L63,41 Z" />
+    <path
+        android:fillColor="#4E342E"
+        android:pathData="M45,41 L45,43 L42,43 L42,41 Z" />
+
+    <!-- Diagonal hour markers (dots) -->
+    <path
+        android:fillColor="#4E342E"
+        android:pathData="M62,33 m-1.2,0 a1.2,1.2 0,1 1,2.4 0 a1.2,1.2 0,1 1,-2.4 0" />
+    <path
+        android:fillColor="#4E342E"
+        android:pathData="M46,33 m-1.2,0 a1.2,1.2 0,1 1,2.4 0 a1.2,1.2 0,1 1,-2.4 0" />
+    <path
+        android:fillColor="#4E342E"
+        android:pathData="M62,51 m-1.2,0 a1.2,1.2 0,1 1,2.4 0 a1.2,1.2 0,1 1,-2.4 0" />
+    <path
+        android:fillColor="#4E342E"
+        android:pathData="M46,51 m-1.2,0 a1.2,1.2 0,1 1,2.4 0 a1.2,1.2 0,1 1,-2.4 0" />
+
+    <!-- Clock hands (showing ~10:10) -->
+    <path
+        android:fillColor="#4E342E"
+        android:strokeWidth="1.2"
+        android:strokeColor="#4E342E"
+        android:pathData="M54,42 L48,34" />
+    <path
+        android:fillColor="#4E342E"
+        android:strokeWidth="1.2"
+        android:strokeColor="#4E342E"
+        android:pathData="M54,42 L60,34" />
+
+    <!-- Center dot -->
+    <path
+        android:fillColor="#4E342E"
+        android:pathData="M54,42 m-1.5,0 a1.5,1.5 0,1 1,3 0 a1.5,1.5 0,1 1,-3 0" />
+
+    <!-- Pendulum window (glass) -->
+    <path
+        android:fillColor="#E0E0E0"
+        android:fillAlpha="0.4"
+        android:pathData="M43,60 L65,60 C66,60 67,61 67,62 L67,82 C67,83 66,84 65,84 L43,84 C42,84 41,83 41,82 L41,62 C41,61 42,60 43,60 Z" />
+
+    <!-- Pendulum rod -->
+    <path
+        android:strokeWidth="1.2"
+        android:strokeColor="#FFD54F"
+        android:pathData="M54,56 L54,82" />
+
+    <!-- Pendulum bob (disc) -->
+    <path
+        android:fillColor="#FFD54F"
+        android:pathData="M54,80 m-5,0 a5,3 0,1 1,10 0 a5,3 0,1 1,-10 0" />
+
+    <!-- Pendulum bob highlight -->
+    <path
+        android:fillColor="#FFE082"
+        android:pathData="M54,79 m-3,0 a3,1.5 0,1 1,6 0 a3,1.5 0,1 1,-6 0" />
+
+    <!-- Base feet -->
+    <path
+        android:fillColor="#4E342E"
+        android:pathData="M32,96 C32,96 30,98 30,99 C30,100 31,100 33,100 L37,100 L37,96 Z" />
+    <path
+        android:fillColor="#4E342E"
+        android:pathData="M76,96 C76,96 78,98 78,99 C78,100 77,100 75,100 L71,100 L71,96 Z" />
+
+</vector>

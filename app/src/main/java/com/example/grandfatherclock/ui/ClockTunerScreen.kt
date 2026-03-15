@@ -146,18 +146,18 @@ fun ClockTunerScreen(
             // Stats
             if (state.running || state.beatCount > 0) {
                 Text(
-                    text = "Ticks: ${state.tickCount}   Beats: ${state.beatCount}",
+                    text = "Beats: ${state.beatCount}   Ticks: ${state.tickCount}",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f),
                 )
 
-                Spacer(modifier = Modifier.height(4.dp))
+                Spacer(modifier = Modifier.height(8.dp))
 
                 val elapsedFormatted = String.format(Locale.US, "%.1f", state.elapsedSeconds)
                 Text(
-                    text = "Elapsed: ${elapsedFormatted}s",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f),
+                    text = "${elapsedFormatted}s",
+                    style = MaterialTheme.typography.headlineLarge,
+                    color = MaterialTheme.colorScheme.onBackground,
                 )
             }
 
