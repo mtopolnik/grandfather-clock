@@ -190,167 +190,238 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
         logger?.log("WAV_ANALYSIS",
             "totalSamples=%d paired_beats: A=%d B=%d".format(totalFileSamples, groupA.size, groupB.size))
 
-        // --- Phase 2: Build templates by iterative align-and-average ---
-        // Each clip is centered on its beat, so data access is clip-local:
-        // clipHalfWidth maps to the beat's sample position.
+        // --- Phase 2: Build templates with normalized correlation ---
+        // Align each clip to the running template using normalized cross-
+        // correlation (immune to amplitude differences), then average.
+        // Two iterations: first builds an initial template, second rebuilds
+        // from scratch using the improved template for alignment.
 
-        fun buildTemplate(groupClipIdx: List<Int>): DoubleArray {
-            val tpl = DoubleArray(tplWidth)
-            val clip0 = diffClips[groupClipIdx[0]]
+        fun normalizedCorrelation(tpl: DoubleArray, clip: ShortArray, off: Int): Double {
+            var dot = 0.0
+            var energy = 1e-12
             for (j in 0 until tplWidth) {
-                val p = clipHalfWidth - tplHalf + j
-                if (p in clip0.indices) tpl[j] = clip0[p].toDouble()
+                val p = clipHalfWidth - tplHalf + off + j
+                val s = if (p in clip.indices) clip[p].toDouble() else 0.0
+                dot += tpl[j] * s
+                energy += s * s
             }
-
-            for (k in 1 until groupClipIdx.size) {
-                val clip = diffClips[groupClipIdx[k]]
-                var bestOff = 0
-                var bestDot = Double.NEGATIVE_INFINITY
-                for (off in -searchRange..searchRange) {
-                    var dot = 0.0
-                    for (j in 0 until tplWidth) {
-                        val p = clipHalfWidth - tplHalf + off + j
-                        if (p in clip.indices) dot += tpl[j] * clip[p]
-                    }
-                    if (dot > bestDot) { bestDot = dot; bestOff = off }
-                }
-
-                for (j in 0 until tplWidth) {
-                    val p = clipHalfWidth - tplHalf + bestOff + j
-                    val s = if (p in clip.indices) clip[p].toDouble() else 0.0
-                    tpl[j] = (tpl[j] * k + s) / (k + 1)
-                }
-            }
-            return tpl
+            return dot / sqrt(energy)
         }
 
-        val templateA = buildTemplate(groupAClip)
-        val templateB = buildTemplate(groupBClip)
-
-        // --- Phase 3: Final-pass alignment against clean templates ---
-        // Returns offset from clip center to best-fit position.
-
-        fun alignBeat(clipIdx: Int, tpl: DoubleArray): Int {
-            val clip = diffClips[clipIdx]
+        fun alignBeatNorm(clip: ShortArray, tpl: DoubleArray): Int {
             var bestOff = 0
-            var bestDot = Double.NEGATIVE_INFINITY
+            var bestScore = Double.NEGATIVE_INFINITY
             for (off in -searchRange..searchRange) {
-                var dot = 0.0
-                for (j in 0 until tplWidth) {
-                    val p = clipHalfWidth - tplHalf + off + j
-                    if (p in clip.indices) dot += tpl[j] * clip[p]
-                }
-                if (dot > bestDot) { bestDot = dot; bestOff = off }
+                val score = normalizedCorrelation(tpl, clip, off)
+                if (score > bestScore) { bestScore = score; bestOff = off }
             }
             return bestOff
         }
 
-        val alignOffsA = IntArray(groupA.size) { alignBeat(groupAClip[it], templateA) }
-        val alignOffsB = IntArray(groupB.size) { alignBeat(groupBClip[it], templateB) }
-        val preciseA = DoubleArray(groupA.size) { (groupA[it] + alignOffsA[it]).toDouble() }
-        val preciseB = DoubleArray(groupB.size) { (groupB[it] + alignOffsB[it]).toDouble() }
+        fun buildTemplate(groupClipIdx: List<Int>, alignWith: DoubleArray?): DoubleArray {
+            val offsets = IntArray(groupClipIdx.size)
+            if (alignWith != null) {
+                // Align each clip to the provided template
+                for (k in groupClipIdx.indices) {
+                    offsets[k] = alignBeatNorm(diffClips[groupClipIdx[k]], alignWith)
+                }
+            }
+            // Average all clips (energy-normalized) to build template
+            val tpl = DoubleArray(tplWidth)
+            for (k in groupClipIdx.indices) {
+                val clip = diffClips[groupClipIdx[k]]
+                val off = offsets[k]
+                var energy = 0.0
+                val window = DoubleArray(tplWidth)
+                for (j in 0 until tplWidth) {
+                    val p = clipHalfWidth - tplHalf + off + j
+                    val s = if (p in clip.indices) clip[p].toDouble() else 0.0
+                    window[j] = s
+                    energy += s * s
+                }
+                val scale = if (energy > 1e-12) 1.0 / sqrt(energy) else 0.0
+                for (j in 0 until tplWidth) {
+                    tpl[j] += window[j] * scale
+                }
+            }
+            // Normalize the final template
+            var tplEnergy = 0.0
+            for (j in 0 until tplWidth) tplEnergy += tpl[j] * tpl[j]
+            if (tplEnergy > 1e-12) {
+                val scale = 1.0 / sqrt(tplEnergy)
+                for (j in 0 until tplWidth) tpl[j] *= scale
+            }
+            return tpl
+        }
 
-        // --- Phase 4: Midpoint regression at sample level ---
-        // Same approach as the real-time best-fit (half-period grid on pair
-        // midpoints) but using precise sample-level positions.
+        // Iteration 1: build initial template by aligning to clip[0]
+        fun seedTemplate(groupClipIdx: List<Int>): DoubleArray {
+            val clip0 = diffClips[groupClipIdx[0]]
+            val seed = DoubleArray(tplWidth)
+            for (j in 0 until tplWidth) {
+                val p = clipHalfWidth - tplHalf + j
+                if (p in clip0.indices) seed[j] = clip0[p].toDouble()
+            }
+            return seed
+        }
+
+        var templateA = buildTemplate(groupAClip, seedTemplate(groupAClip))
+        var templateB = buildTemplate(groupBClip, seedTemplate(groupBClip))
+        // Iteration 2: rebuild using the improved templates for alignment
+        templateA = buildTemplate(groupAClip, templateA)
+        templateB = buildTemplate(groupBClip, templateB)
+
+        // --- Phase 3: Final-pass alignment with sub-sample precision ---
+        // Normalized correlation for coarse offset, then parabolic
+        // interpolation for fractional-sample refinement.
+
+        fun alignBeatPrecise(clipIdx: Int, tpl: DoubleArray): Double {
+            val clip = diffClips[clipIdx]
+            val bestOff = alignBeatNorm(clip, tpl)
+            // Parabolic interpolation around the best integer offset
+            val left = normalizedCorrelation(tpl, clip, bestOff - 1)
+            val center = normalizedCorrelation(tpl, clip, bestOff)
+            val right = normalizedCorrelation(tpl, clip, bestOff + 1)
+            val denom = left - 2.0 * center + right
+            val frac = if (abs(denom) > 1e-10) (0.5 * (left - right) / denom).coerceIn(-0.5, 0.5) else 0.0
+            return bestOff + frac
+        }
+
+        val alignOffsA = DoubleArray(groupA.size) { alignBeatPrecise(groupAClip[it], templateA) }
+        val alignOffsB = DoubleArray(groupB.size) { alignBeatPrecise(groupBClip[it], templateB) }
+        val preciseA = DoubleArray(groupA.size) { groupA[it] + alignOffsA[it] }
+        val preciseB = DoubleArray(groupB.size) { groupB[it] + alignOffsB[it] }
+
+        // --- Phase 4: Separate tick/tock regression with outlier rejection ---
+        // Fit A (tick) and B (tock) positions independently on a full-period
+        // grid, each with its own intercept. This avoids the tick-tock
+        // asymmetry inflating the residuals. Combine the two slope estimates
+        // weighted by inverse variance. Outlier rejection via MAD.
         val m = minOf(preciseA.size, preciseB.size)
         if (m < 4) return null
 
-        val midpoints = DoubleArray(m) { (preciseA[it] + preciseB[it]) / 2.0 }
-        val approxHalfPeriodSamples = approxPeriodSamples / 2.0
-
-        val indices = IntArray(m)
-        for (j in 1 until m) {
-            indices[j] = ((midpoints[j] - midpoints[0]) / approxHalfPeriodSamples).roundToInt()
+        // Assign period-grid indices (full-period spacing).
+        // For group X: index[k] = round((X[k] - X[0]) / approxPeriod)
+        fun assignIndices(positions: DoubleArray): IntArray {
+            val idx = IntArray(positions.size)
+            for (j in 1 until positions.size) {
+                idx[j] = ((positions[j] - positions[0]) / approxPeriodSamples).roundToInt()
+            }
+            return idx
         }
 
-        // Linear regression: midpoints[j] = t0 + indices[j] * halfP
-        var sk = 0.0; var skk = 0.0; var sp = 0.0; var skp = 0.0
-        for (j in 0 until m) {
-            val k = indices[j].toDouble()
-            val p = midpoints[j]
-            sk += k; skk += k * k; sp += p; skp += k * p
+        // Linear regression: position[j] = t0 + index[j] * period
+        // Returns (slope, slopeVariance, inlierCount) or null.
+        // Two passes: first fits all, computes MAD, removes outliers; second refits.
+        data class LineFit(val slope: Double, val slopeVar: Double, val inliers: Int, val rms: Double)
+
+        fun fitLine(positions: DoubleArray, indices: IntArray): LineFit? {
+            var pos = positions.toMutableList()
+            var idx = indices.toMutableList()
+            var slope = 0.0
+            var slopeVar = 0.0
+            var rms = 0.0
+            for (pass in 0..1) {
+                val n = pos.size
+                if (n < 3) return null
+                var sk = 0.0; var skk = 0.0; var sp = 0.0; var skp = 0.0
+                for (j in 0 until n) {
+                    val k = idx[j].toDouble()
+                    sk += k; skk += k * k; sp += pos[j]; skp += k * pos[j]
+                }
+                val det = n.toDouble() * skk - sk * sk
+                if (abs(det) < 1e-12) return null
+                slope = (n.toDouble() * skp - sk * sp) / det
+                if (slope <= 0) return null
+                val t0 = (skk * sp - sk * skp) / det
+                val residuals = DoubleArray(n) { pos[it] - (t0 + idx[it] * slope) }
+
+                if (pass == 0) {
+                    val sortedAbs = residuals.map { abs(it) }.sorted()
+                    val medAbsDev = sortedAbs[sortedAbs.size / 2]
+                    val robustScale = maxOf(1.0, 1.4826 * medAbsDev)
+                    val cutoff = 3.5 * robustScale
+                    val newPos = mutableListOf<Double>()
+                    val newIdx = mutableListOf<Int>()
+                    for (j in 0 until n) {
+                        if (abs(residuals[j]) <= cutoff) {
+                            newPos.add(pos[j])
+                            newIdx.add(idx[j])
+                        }
+                    }
+                    if (newPos.size < n) {
+                        logger?.log("WAV_OUTLIER",
+                            "removed %d/%d beats (cutoff=%.1f samples)"
+                                .format(n - newPos.size, n, cutoff))
+                    }
+                    pos = newPos
+                    idx = newIdx
+                } else {
+                    var sumResidualSq = 0.0
+                    for (r in residuals) sumResidualSq += r * r
+                    val sigma2 = if (n > 2) sumResidualSq / (n - 2) else 0.0
+                    slopeVar = if (abs(det) > 1e-20 && n > 2) n.toDouble() / det * sigma2 else 0.0
+                    rms = if (n > 2) sqrt(sigma2) else 0.0
+                }
+            }
+            return LineFit(slope, slopeVar, pos.size, rms)
         }
 
-        val det = m.toDouble() * skk - sk * sk
-        if (abs(det) < 1e-12) return null
+        val idxA = assignIndices(preciseA)
+        val idxB = assignIndices(preciseB)
+        val fitA = fitLine(preciseA, idxA)
+        val fitB = fitLine(preciseB, idxB)
 
-        val halfP = (m.toDouble() * skp - sk * sp) / det
-        if (halfP <= 0) return null
+        if (fitA == null && fitB == null) return null
 
-        val period = halfP * 2.0
-
-        var sumResidualSq = 0.0
-        val t0 = (skk * sp - sk * skp) / det
-        for (j in 0 until m) {
-            val residual = midpoints[j] - (t0 + indices[j] * halfP)
-            sumResidualSq += residual * residual
+        // Combine slopes weighted by inverse variance
+        val period: Double
+        val periodVar: Double
+        val rmsResidual: Double
+        val inlierCount: Int
+        if (fitA != null && fitB != null) {
+            if (fitA.slopeVar > 0 && fitB.slopeVar > 0) {
+                val wA = 1.0 / fitA.slopeVar
+                val wB = 1.0 / fitB.slopeVar
+                period = (fitA.slope * wA + fitB.slope * wB) / (wA + wB)
+                periodVar = 1.0 / (wA + wB)
+            } else {
+                period = (fitA.slope + fitB.slope) / 2.0
+                periodVar = 0.0
+            }
+            rmsResidual = (fitA.rms + fitB.rms) / 2.0
+            inlierCount = fitA.inliers + fitB.inliers
+        } else {
+            val fit = fitA ?: fitB!!
+            period = fit.slope
+            periodVar = fit.slopeVar
+            rmsResidual = fit.rms
+            inlierCount = fit.inliers
         }
-        val sigma2 = if (m > 2) sumResidualSq / (m - 2) else 0.0
-        val halfPVar = if (abs(det) > 1e-20 && m > 2) m.toDouble() / det * sigma2 else 0.0
-        val rmsResidual = if (m > 2) sqrt(sigma2) else 0.0
 
         val wavPeriod = period / sampleRate * 1_000_000.0
-        val wavUncertainty = if (halfPVar > 0) 2.0 * sqrt(halfPVar) / sampleRate * 1_000_000.0 else 0.0
+        val wavUncertainty = if (periodVar > 0) sqrt(periodVar) / sampleRate * 1_000_000.0 else 0.0
 
         logger?.log("WAV_RESULT",
-            "period=%.3f samples (%.1fµs ±%.1fµs) pairs=%d rms=%.2f"
-                .format(period, wavPeriod, wavUncertainty, m, rmsResidual))
+            "period=%.3f samples (%.1fµs ±%.1fµs) inliers=%d rms=%.2f"
+                .format(period, wavPeriod, wavUncertainty, inlierCount, rmsResidual))
 
         // --- Phase 5: Write idealized tick-tock WAV ---
 
-        // Sub-sample refinement using diff clips (still loaded).
-        // Computes integer and fractional offsets per beat via cross-correlation
-        // with the diff-domain template + parabolic interpolation.
-
-        fun refinePositions(alignOffsets: IntArray, groupClipIdx: List<Int>,
-                            diffTpl: DoubleArray): Pair<IntArray, DoubleArray> {
-            val intOffs = IntArray(alignOffsets.size)
-            val fracOffs = DoubleArray(alignOffsets.size)
-            for (k in alignOffsets.indices) {
-                val clip = diffClips[groupClipIdx[k]]
-                val baseOff = alignOffsets[k]
-                val xcorr = DoubleArray(2 * refineRange + 1)
-                for (off in -refineRange..refineRange) {
-                    var dot = 0.0
-                    for (j in 0 until tplWidth) {
-                        val p = clipHalfWidth + baseOff - tplHalf + off + j
-                        if (p in clip.indices) dot += diffTpl[j] * clip[p]
-                    }
-                    xcorr[off + refineRange] = dot
-                }
-                var bestIdx = refineRange
-                for (i in xcorr.indices) {
-                    if (xcorr[i] > xcorr[bestIdx]) bestIdx = i
-                }
-                intOffs[k] = bestIdx - refineRange
-                fracOffs[k] = if (bestIdx in 1 until xcorr.size - 1) {
-                    val a = xcorr[bestIdx - 1]; val b = xcorr[bestIdx]; val c = xcorr[bestIdx + 1]
-                    val d = a - 2.0 * b + c
-                    if (abs(d) > 1e-10) (0.5 * (a - c) / d).coerceIn(-0.5, 0.5) else 0.0
-                } else 0.0
-            }
-            return Pair(intOffs, fracOffs)
-        }
-
-        val (intOffsA, fracOffsA) = refinePositions(alignOffsA, groupAClip, templateA)
-        val (intOffsB, fracOffsB) = refinePositions(alignOffsB, groupBClip, templateB)
-
-        // Load raw clips for sinc interpolation (diffClips no longer needed)
+        // Split the precise double offsets into integer + fractional parts
+        // for sinc interpolation on raw (undifferenced) clips.
         val rawClips = readWav(wavFile, beatFrames, clipHalfWidth) ?: return null
         val amplitudeThreshold = 0.9 * 32767
 
-        fun buildRawTemplate(alignOffsets: IntArray, intOffs: IntArray,
-                             fracOffs: DoubleArray, groupClipIdx: List<Int>): ShortArray {
+        fun buildRawTemplate(alignOffsets: DoubleArray, groupClipIdx: List<Int>): ShortArray {
             val tpl = DoubleArray(tplWidth)
             for (k in alignOffsets.indices) {
                 val clip = rawClips[groupClipIdx[k]]
-                val baseOff = alignOffsets[k]
-                val bestOff = intOffs[k]
-                val fracOff = fracOffs[k]
+                val intOff = alignOffsets[k].roundToInt()
+                val fracOff = alignOffsets[k] - intOff
                 for (j in 0 until tplWidth) {
                     var sample = 0.0
-                    val intPos = clipHalfWidth + baseOff - tplHalf + bestOff + j
+                    val intPos = clipHalfWidth + intOff - tplHalf + j
                     for (t in -sincHalfLen..sincHalfLen) {
                         val pos = intPos + t
                         if (pos in clip.indices) {
@@ -369,8 +440,8 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
             return ShortArray(tplWidth) { (tpl[it] * scale).roundToInt().coerceIn(-32768, 32767).toShort() }
         }
 
-        val rawTickTemplate = buildRawTemplate(alignOffsA, intOffsA, fracOffsA, groupAClip)
-        val rawTockTemplate = buildRawTemplate(alignOffsB, intOffsB, fracOffsB, groupBClip)
+        val rawTickTemplate = buildRawTemplate(alignOffsA, groupAClip)
+        val rawTockTemplate = buildRawTemplate(alignOffsB, groupBClip)
 
         // Silence durations: beat-to-beat gap minus template width
         val tickToTockSamples = (0 until m).map { preciseB[it] - preciseA[it] }.average()
