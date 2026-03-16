@@ -141,9 +141,19 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
     fun analyzeWavFile(wavFile: File): State? {
         if (periodMicros <= 0.0 || beatFrames.size < 8) return null
 
-        val (diffSamples, skipSamples) = readWav(wavFile, diff = true) ?: return null
-        val n = diffSamples.size
-        if (n < sampleRate * 3) return null
+        // Clip geometry: enough room for template matching, alignment, and sinc
+        val tplWidth = sampleRate / 50                     // 20 ms = 882 samples
+        val tplHalf = tplWidth / 2
+        val searchRange = frameSamples                     // ±1 frame = ±220 samples
+        val sincHalfLen = 8
+        val refineRange = 3
+        val clipHalfWidth = tplHalf + searchRange + refineRange + sincHalfLen  // 672
+
+        val totalFileSamples = ((wavFile.length() - 44) / 2).toInt()
+        if (totalFileSamples < sampleRate * 3) return null
+
+        // Read only small clips around each beat instead of the whole file
+        val diffClips = readWav(wavFile, beatFrames, clipHalfWidth, diff = true) ?: return null
 
         val approxPeriodSamples = periodMicros / 1_000_000.0 * sampleRate
         val approxHalfPeriod = approxPeriodSamples / 2.0
@@ -152,16 +162,21 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
         // formation: consecutive beats with a valid half-period gap.
         val halfMin = approxHalfPeriod * 0.85
         val halfMax = approxHalfPeriod * 1.15
-        val groupA = mutableListOf<Int>()   // approximate sample positions
+        val groupA = mutableListOf<Int>()     // sample positions (for period math)
         val groupB = mutableListOf<Int>()
+        val groupAClip = mutableListOf<Int>() // indices into clips array (for data access)
+        val groupBClip = mutableListOf<Int>()
         var idx = 0
         while (idx < beatFrames.size - 1) {
-            val posA = beatFrames[idx] * frameSamples - skipSamples
-            val posB = beatFrames[idx + 1] * frameSamples - skipSamples
+            val posA = beatFrames[idx] * frameSamples
+            val posB = beatFrames[idx + 1] * frameSamples
             val gap = posB - posA
-            if (gap >= halfMin && gap <= halfMax && posA >= 0 && posB < n) {
+            if (gap >= halfMin && gap <= halfMax
+                && posA >= clipHalfWidth && posB + clipHalfWidth <= totalFileSamples) {
                 groupA.add(posA)
                 groupB.add(posB)
+                groupAClip.add(idx)
+                groupBClip.add(idx + 1)
                 idx += 2
             } else {
                 idx += 1
@@ -173,68 +188,67 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
             return null
         }
         logger?.log("WAV_ANALYSIS",
-            "samples=%d paired_beats: A=%d B=%d".format(n, groupA.size, groupB.size))
+            "totalSamples=%d paired_beats: A=%d B=%d".format(totalFileSamples, groupA.size, groupB.size))
 
         // --- Phase 2: Build templates by iterative align-and-average ---
+        // Each clip is centered on its beat, so data access is clip-local:
+        // clipHalfWidth maps to the beat's sample position.
 
-        val tplWidth = sampleRate / 50                     // 20 ms = 882 samples
-        val tplHalf = tplWidth / 2
-        val searchRange = frameSamples                     // ±1 frame = ±220 samples
-
-        fun buildTemplate(group: List<Int>): DoubleArray {
-            // Seed with first beat
+        fun buildTemplate(groupClipIdx: List<Int>): DoubleArray {
             val tpl = DoubleArray(tplWidth)
-            val c0 = group[0]
+            val clip0 = diffClips[groupClipIdx[0]]
             for (j in 0 until tplWidth) {
-                val pos = c0 - tplHalf + j
-                if (pos in 0 until n) tpl[j] = diffSamples[pos].toDouble()
+                val p = clipHalfWidth - tplHalf + j
+                if (p in clip0.indices) tpl[j] = clip0[p].toDouble()
             }
 
-            // Iteratively align and average subsequent beats
-            for (k in 1 until group.size) {
-                val center = group[k]
+            for (k in 1 until groupClipIdx.size) {
+                val clip = diffClips[groupClipIdx[k]]
                 var bestOff = 0
                 var bestDot = Double.NEGATIVE_INFINITY
                 for (off in -searchRange..searchRange) {
                     var dot = 0.0
                     for (j in 0 until tplWidth) {
-                        val pos = center - tplHalf + off + j
-                        if (pos in 0 until n) dot += tpl[j] * diffSamples[pos]
+                        val p = clipHalfWidth - tplHalf + off + j
+                        if (p in clip.indices) dot += tpl[j] * clip[p]
                     }
                     if (dot > bestDot) { bestDot = dot; bestOff = off }
                 }
 
-                // Average aligned window into template
                 for (j in 0 until tplWidth) {
-                    val pos = center - tplHalf + bestOff + j
-                    val s = if (pos in 0 until n) diffSamples[pos].toDouble() else 0.0
+                    val p = clipHalfWidth - tplHalf + bestOff + j
+                    val s = if (p in clip.indices) clip[p].toDouble() else 0.0
                     tpl[j] = (tpl[j] * k + s) / (k + 1)
                 }
             }
             return tpl
         }
 
-        val templateA = buildTemplate(groupA)
-        val templateB = buildTemplate(groupB)
+        val templateA = buildTemplate(groupAClip)
+        val templateB = buildTemplate(groupBClip)
 
         // --- Phase 3: Final-pass alignment against clean templates ---
+        // Returns offset from clip center to best-fit position.
 
-        fun alignBeat(center: Int, tpl: DoubleArray): Int {
+        fun alignBeat(clipIdx: Int, tpl: DoubleArray): Int {
+            val clip = diffClips[clipIdx]
             var bestOff = 0
             var bestDot = Double.NEGATIVE_INFINITY
             for (off in -searchRange..searchRange) {
                 var dot = 0.0
                 for (j in 0 until tplWidth) {
-                    val pos = center - tplHalf + off + j
-                    if (pos in 0 until n) dot += tpl[j] * diffSamples[pos]
+                    val p = clipHalfWidth - tplHalf + off + j
+                    if (p in clip.indices) dot += tpl[j] * clip[p]
                 }
                 if (dot > bestDot) { bestDot = dot; bestOff = off }
             }
             return bestOff
         }
 
-        val preciseA = DoubleArray(groupA.size) { (groupA[it] + alignBeat(groupA[it], templateA)).toDouble() }
-        val preciseB = DoubleArray(groupB.size) { (groupB[it] + alignBeat(groupB[it], templateB)).toDouble() }
+        val alignOffsA = IntArray(groupA.size) { alignBeat(groupAClip[it], templateA) }
+        val alignOffsB = IntArray(groupB.size) { alignBeat(groupBClip[it], templateB) }
+        val preciseA = DoubleArray(groupA.size) { (groupA[it] + alignOffsA[it]).toDouble() }
+        val preciseB = DoubleArray(groupB.size) { (groupB[it] + alignOffsB[it]).toDouble() }
 
         // --- Phase 4: Midpoint regression at sample level ---
         // Same approach as the real-time best-fit (half-period grid on pair
@@ -285,23 +299,23 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
 
         // --- Phase 5: Write idealized tick-tock WAV ---
 
-        // Sub-sample refinement using diff signal (still loaded).
+        // Sub-sample refinement using diff clips (still loaded).
         // Computes integer and fractional offsets per beat via cross-correlation
         // with the diff-domain template + parabolic interpolation.
-        val sincHalfLen = 8
-        val refineRange = 3
 
-        fun refinePositions(positions: DoubleArray, diffTpl: DoubleArray): Pair<IntArray, DoubleArray> {
-            val intOffs = IntArray(positions.size)
-            val fracOffs = DoubleArray(positions.size)
-            for (k in positions.indices) {
-                val center = positions[k].roundToInt()
+        fun refinePositions(alignOffsets: IntArray, groupClipIdx: List<Int>,
+                            diffTpl: DoubleArray): Pair<IntArray, DoubleArray> {
+            val intOffs = IntArray(alignOffsets.size)
+            val fracOffs = DoubleArray(alignOffsets.size)
+            for (k in alignOffsets.indices) {
+                val clip = diffClips[groupClipIdx[k]]
+                val baseOff = alignOffsets[k]
                 val xcorr = DoubleArray(2 * refineRange + 1)
                 for (off in -refineRange..refineRange) {
                     var dot = 0.0
                     for (j in 0 until tplWidth) {
-                        val pos = center - tplHalf + off + j
-                        if (pos in 0 until n) dot += diffTpl[j] * diffSamples[pos]
+                        val p = clipHalfWidth + baseOff - tplHalf + off + j
+                        if (p in clip.indices) dot += diffTpl[j] * clip[p]
                     }
                     xcorr[off + refineRange] = dot
                 }
@@ -319,31 +333,32 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
             return Pair(intOffs, fracOffs)
         }
 
-        val (intOffsA, fracOffsA) = refinePositions(preciseA, templateA)
-        val (intOffsB, fracOffsB) = refinePositions(preciseB, templateB)
+        val (intOffsA, fracOffsA) = refinePositions(alignOffsA, groupAClip, templateA)
+        val (intOffsB, fracOffsB) = refinePositions(alignOffsB, groupBClip, templateB)
 
-        // Load raw samples for sinc interpolation (diffSamples no longer needed)
-        val (rawSamples, _) = readWav(wavFile) ?: return null
-        val nRaw = rawSamples.size
+        // Load raw clips for sinc interpolation (diffClips no longer needed)
+        val rawClips = readWav(wavFile, beatFrames, clipHalfWidth) ?: return null
         val amplitudeThreshold = 0.9 * 32767
 
-        fun buildRawTemplate(positions: DoubleArray, intOffs: IntArray, fracOffs: DoubleArray): ShortArray {
+        fun buildRawTemplate(alignOffsets: IntArray, intOffs: IntArray,
+                             fracOffs: DoubleArray, groupClipIdx: List<Int>): ShortArray {
             val tpl = DoubleArray(tplWidth)
-            for (k in positions.indices) {
-                val center = positions[k].roundToInt()
+            for (k in alignOffsets.indices) {
+                val clip = rawClips[groupClipIdx[k]]
+                val baseOff = alignOffsets[k]
                 val bestOff = intOffs[k]
                 val fracOff = fracOffs[k]
                 for (j in 0 until tplWidth) {
                     var sample = 0.0
-                    val intPos = center - tplHalf + bestOff + j
+                    val intPos = clipHalfWidth + baseOff - tplHalf + bestOff + j
                     for (t in -sincHalfLen..sincHalfLen) {
                         val pos = intPos + t
-                        if (pos in 0 until nRaw) {
+                        if (pos in clip.indices) {
                             val x = t.toDouble() - fracOff
                             val sincVal = if (abs(x) < 1e-10) 1.0
                                 else sin(PI * x) / (PI * x)
                             val win = 0.5 * (1.0 + cos(PI * x / sincHalfLen))
-                            sample += rawSamples[pos].toDouble() * sincVal * win
+                            sample += clip[pos].toDouble() * sincVal * win
                         }
                     }
                     tpl[j] += sample
@@ -354,8 +369,8 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
             return ShortArray(tplWidth) { (tpl[it] * scale).roundToInt().coerceIn(-32768, 32767).toShort() }
         }
 
-        val rawTickTemplate = buildRawTemplate(preciseA, intOffsA, fracOffsA)
-        val rawTockTemplate = buildRawTemplate(preciseB, intOffsB, fracOffsB)
+        val rawTickTemplate = buildRawTemplate(alignOffsA, intOffsA, fracOffsA, groupAClip)
+        val rawTockTemplate = buildRawTemplate(alignOffsB, intOffsB, fracOffsB, groupBClip)
 
         // Silence durations: beat-to-beat gap minus template width
         val tickToTockSamples = (0 until m).map { preciseB[it] - preciseA[it] }.average()
@@ -799,48 +814,61 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
         }
     }
 
-    private data class WavData(val samples: ShortArray, val skipSamples: Int)
-
     /**
-     * Read a WAV file into a ShortArray using buffered I/O (no intermediate
-     * full-size ByteArray).  When [diff] is true, returns sample-to-sample
-     * differences clipped to 16-bit range (first element is 0).
+     * Read clips from a WAV file centered on each beat position.
+     * Each clip is 2 * [clipHalfWidth] samples wide, centered on the
+     * beat's sample position (beats[i] * [frameSamples]).
+     * When [diff] is true, returns sample-to-sample differences
+     * clipped to 16-bit range (first element of each clip is 0).
      */
-    private fun readWav(file: File, diff: Boolean = false): WavData? {
+    private fun readWav(
+        file: File,
+        beats: List<Int>,
+        clipHalfWidth: Int,
+        diff: Boolean = false,
+    ): Array<ShortArray>? {
         return try {
             RandomAccessFile(file, "r").use { raf ->
-                raf.seek(44)
-                val dataBytes = (raf.length() - 44).toInt()
-                val maxBytes = sampleRate * 600 * 2  // 10 minutes
-                val bytesToRead = minOf(dataBytes, maxBytes)
-                val skipSamples = if (dataBytes > maxBytes) (dataBytes - maxBytes) / 2 else 0
-                if (skipSamples > 0) raf.seek(44L + skipSamples * 2L)
-                val numSamples = bytesToRead / 2
-                val samples = ShortArray(numSamples)
-                val chunkBuf = ByteArray(8192)
-                var written = 0
-                var prev: Short = 0
-                while (written < numSamples) {
-                    val toRead = minOf(chunkBuf.size, (numSamples - written) * 2)
-                    raf.readFully(chunkBuf, 0, toRead)
-                    val bb = ByteBuffer.wrap(chunkBuf, 0, toRead).order(ByteOrder.LITTLE_ENDIAN)
-                    val count = toRead / 2
-                    for (i in 0 until count) {
-                        val s = bb.short
-                        if (diff) {
-                            if (written == 0) {
-                                samples[0] = 0
+                val totalFileSamples = ((raf.length() - 44) / 2).toInt()
+                val clipSize = 2 * clipHalfWidth
+
+                Array(beats.size) { i ->
+                    val centerSample = beats[i] * frameSamples
+                    val clipStart = centerSample - clipHalfWidth
+                    val clip = ShortArray(clipSize)
+
+                    val readStart = maxOf(0, clipStart)
+                    val readEnd = minOf(totalFileSamples, clipStart + clipSize)
+                    if (readEnd <= readStart) return@Array clip
+
+                    val clipOffset = readStart - clipStart
+                    val samplesToRead = readEnd - readStart
+
+                    raf.seek(44L + readStart.toLong() * 2L)
+                    val bytes = ByteArray(samplesToRead * 2)
+                    raf.readFully(bytes)
+                    val bb = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+
+                    if (diff) {
+                        var prev: Short = 0
+                        for (j in 0 until samplesToRead) {
+                            val s = bb.short
+                            if (j == 0) {
+                                clip[clipOffset] = 0
                             } else {
-                                samples[written] = (s - prev).coerceIn(-32768, 32767).toShort()
+                                clip[clipOffset + j] =
+                                    (s - prev).coerceIn(-32768, 32767).toShort()
                             }
                             prev = s
-                        } else {
-                            samples[written] = s
                         }
-                        written++
+                    } else {
+                        for (j in 0 until samplesToRead) {
+                            clip[clipOffset + j] = bb.short
+                        }
                     }
+
+                    clip
                 }
-                WavData(samples, skipSamples)
             }
         } catch (_: Exception) {
             null

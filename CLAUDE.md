@@ -10,7 +10,25 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ./gradlew clean                # Clean build artifacts
 ```
 
-No test suite exists yet. The project has no unit or instrumentation tests.
+## Testing
+
+`TickDetectorSimulationTest.simulateFromWav` replays a real WAV recording through `TickDetector`, running both real-time beat detection and WAV-refined analysis. It requires a clock recording WAV file.
+
+```bash
+# Point WAV_FILE at a recording pulled from the device:
+WAV_FILE=/path/to/clock_recording.wav ./gradlew testDebugUnitTest \
+  --tests "com.example.grandfatherclock.audio.TickDetectorSimulationTest.simulateFromWav"
+```
+
+The test also checks `~/Desktop/clock_recording.wav` as a fallback. It writes a `session.log` next to the WAV file with detailed detection traces.
+
+To pull recordings from a connected device:
+
+```bash
+adb pull /storage/emulated/0/Android/data/com.example.grandfatherclock/files/ /dest/
+```
+
+That directory contains `clock_recording.wav`, `clock_idealized.wav`, and `session.log`.
 
 ## Project Overview
 
