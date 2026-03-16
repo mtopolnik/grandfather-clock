@@ -6,15 +6,18 @@ import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
@@ -82,6 +85,7 @@ fun ClockTunerScreen(
     onRequestPermission: () -> Unit,
 ) {
     val state by viewModel.state.collectAsState()
+    val recordingMinutes by viewModel.recordingMinutes.collectAsState()
     val isUpsideDown = rememberIsUpsideDown()
 
     M3Surface(
@@ -161,7 +165,7 @@ fun ClockTunerScreen(
                 )
             }
 
-            Spacer(modifier = Modifier.height(40.dp))
+            Spacer(modifier = Modifier.height(24.dp))
 
             // Start / Stop button
             if (!hasPermission) {
@@ -195,6 +199,14 @@ fun ClockTunerScreen(
                     )
                 }
             }
+
+            Spacer(modifier = Modifier.height(24.dp))
+
+            // Duration selector
+            DurationSelector(
+                minutes = recordingMinutes,
+                onMinutesChange = { viewModel.setRecordingMinutes(it) },
+            )
 
             if (!state.running && state.wavPath != null) {
                 val dir = state.wavPath!!.substringBeforeLast('/')
@@ -282,4 +294,55 @@ private fun FlashingCircle(
             .clip(CircleShape)
             .background(animatedColor),
     )
+}
+
+@Composable
+private fun DurationSelector(
+    minutes: Int,
+    onMinutesChange: (Int) -> Unit,
+) {
+    val textColor = Color.White
+    val arrowColor = SyncGreen
+    val disabledAlpha = 0.25f
+
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.Center,
+    ) {
+        Text(
+            text = "\u25C0",
+            fontSize = 24.sp,
+            color = if (minutes > 1) arrowColor else arrowColor.copy(alpha = disabledAlpha),
+            modifier = Modifier
+                .clickable(enabled = minutes > 1) { onMinutesChange(minutes - 1) }
+                .padding(12.dp),
+        )
+
+        Spacer(modifier = Modifier.width(4.dp))
+
+        Box(
+            modifier = Modifier
+                .border(1.dp, textColor.copy(alpha = 0.3f), RoundedCornerShape(8.dp))
+                .padding(horizontal = 20.dp, vertical = 8.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                text = "$minutes min",
+                fontSize = 24.sp,
+                fontWeight = FontWeight.Bold,
+                color = textColor,
+            )
+        }
+
+        Spacer(modifier = Modifier.width(4.dp))
+
+        Text(
+            text = "\u25B6",
+            fontSize = 24.sp,
+            color = if (minutes < 30) arrowColor else arrowColor.copy(alpha = disabledAlpha),
+            modifier = Modifier
+                .clickable(enabled = minutes < 30) { onMinutesChange(minutes + 1) }
+                .padding(12.dp),
+        )
+    }
 }

@@ -1,6 +1,8 @@
 package com.example.grandfatherclock
 
-import androidx.lifecycle.ViewModel
+import android.app.Application
+import android.content.Context
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.grandfatherclock.audio.AudioCapture
 import com.example.grandfatherclock.audio.SessionLogger
@@ -14,7 +16,11 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import java.io.File
 
-class MainViewModel : ViewModel() {
+private const val KEY_RECORDING_MINUTES = "recording_minutes"
+
+class MainViewModel(application: Application) : AndroidViewModel(application) {
+
+    private val prefs = application.getSharedPreferences("clock_prefs", Context.MODE_PRIVATE)
 
     data class UiState(
         val running: Boolean = false,
@@ -46,8 +52,13 @@ class MainViewModel : ViewModel() {
     private var wavAnalysisJob: Job? = null
     private var autoStopJob: Job? = null
 
-    companion object {
-        private const val MAX_SESSION_MILLIS = 600 * 1000L
+    private val _recordingMinutes = MutableStateFlow(prefs.getInt(KEY_RECORDING_MINUTES, 10))
+    val recordingMinutes: StateFlow<Int> = _recordingMinutes.asStateFlow()
+
+    fun setRecordingMinutes(minutes: Int) {
+        _recordingMinutes.value = minutes.coerceIn(1, 30)
+        prefs.edit().putInt(KEY_RECORDING_MINUTES, _recordingMinutes.value).apply()
+        if (_state.value.running) restartAutoStop()
     }
 
     var wavOutputDir: File? = null
@@ -83,17 +94,30 @@ class MainViewModel : ViewModel() {
             wavOutputDir = wavOutputDir,
         )
         audioCapture?.start()
+        RecordingService.start(getApplication())
 
+        restartAutoStop()
+    }
+
+    private fun restartAutoStop() {
         autoStopJob?.cancel()
-        autoStopJob = viewModelScope.launch {
-            delay(MAX_SESSION_MILLIS)
+        val maxMillis = _recordingMinutes.value * 60 * 1000L
+        val elapsedMillis = (_state.value.elapsedSeconds * 1000).toLong()
+        val remaining = maxMillis - elapsedMillis
+        if (remaining <= 0) {
             stop()
+        } else {
+            autoStopJob = viewModelScope.launch {
+                delay(remaining)
+                stop()
+            }
         }
     }
 
     fun stop() {
         autoStopJob?.cancel()
         autoStopJob = null
+        RecordingService.stop(getApplication())
         audioCapture?.stop()
         val wavFile = audioCapture?.wavFile
         val path = wavFile?.absolutePath
