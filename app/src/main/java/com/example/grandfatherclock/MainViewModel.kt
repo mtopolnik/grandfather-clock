@@ -38,6 +38,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         /** WAV-refined period (template matching on full recording). */
         val wavPeriodMicros: Double = 0.0,
         val wavUncertaintyMicros: Double = 0.0,
+        /** Tick-to-tock minus ideal half-period, in µs. */
+        val imbalanceMicros: Double = 0.0,
+        val imbalanceUncertaintyMicros: Double = 0.0,
         val analyzing: Boolean = false,
         val wavPath: String? = null,
         val logPath: String? = null,
@@ -138,6 +141,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     _state.value.copy(
                         wavPeriodMicros = result.periodMicros,
                         wavUncertaintyMicros = result.uncertaintyMicros,
+                        imbalanceMicros = result.imbalanceMicros,
+                        imbalanceUncertaintyMicros = result.imbalanceUncertaintyMicros,
                         analyzing = false,
                     )
                 } else {

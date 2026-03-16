@@ -150,7 +150,7 @@ fun ClockTunerScreen(
             // Stats
             if (state.running || state.beatCount > 0) {
                 Text(
-                    text = "Beats: ${state.beatCount}   Ticks: ${state.tickCount}",
+                    text = "Beats: ${state.beatCount}",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f),
                 )
@@ -162,6 +162,20 @@ fun ClockTunerScreen(
                     text = "${elapsedFormatted}s",
                     style = MaterialTheme.typography.headlineLarge,
                     color = MaterialTheme.colorScheme.onBackground,
+                )
+            }
+
+            // Imbalance (shown after WAV analysis)
+            if (state.wavPeriodMicros > 0) {
+                Spacer(modifier = Modifier.height(12.dp))
+                val numFmt = NumberFormat.getNumberInstance(Locale.US).apply {
+                    maximumFractionDigits = 0
+                }
+                val absImbalance = kotlin.math.abs(state.imbalanceMicros)
+                Text(
+                    text = "Imbalance: ${numFmt.format(absImbalance)} \u00B1 ${numFmt.format(state.imbalanceUncertaintyMicros)} \u00B5s",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f),
                 )
             }
 

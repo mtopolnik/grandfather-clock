@@ -65,6 +65,11 @@ class TickDetectorSimulationTest {
             println("\n=== WAV-refined result ===")
             println("Period:      %.1f µs".format(refined.periodMicros))
             println("Uncertainty: ±%.1f µs".format(refined.uncertaintyMicros))
+            if (refined.imbalanceMicros != 0.0 || refined.imbalanceUncertaintyMicros != 0.0) {
+                val sign = if (refined.imbalanceMicros >= 0) "+" else "−"
+                println("Imbalance:   %s%.0f ± %.0f µs".format(
+                    sign, kotlin.math.abs(refined.imbalanceMicros), refined.imbalanceUncertaintyMicros))
+            }
         }
         println("\nLog: ${outputDir.absolutePath}/session.log")
 

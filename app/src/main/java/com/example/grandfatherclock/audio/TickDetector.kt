@@ -53,6 +53,9 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
         val elapsedSamples: Long = 0,
         val synced: Boolean = false,
         val method: Method = Method.NONE,
+        /** Tick-to-tock minus ideal half-period, in µs (positive = tick-tock gap is longer). */
+        val imbalanceMicros: Double = 0.0,
+        val imbalanceUncertaintyMicros: Double = 0.0,
     )
 
     // ---- Frame geometry ----
@@ -443,9 +446,18 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
         val rawTickTemplate = buildRawTemplate(alignOffsA, groupAClip)
         val rawTockTemplate = buildRawTemplate(alignOffsB, groupBClip)
 
-        // Silence durations: beat-to-beat gap minus template width
-        val tickToTockSamples = (0 until m).map { preciseB[it] - preciseA[it] }.average()
+        // Tick-to-tock gap statistics
+        val tickToTockGaps = DoubleArray(m) { preciseB[it] - preciseA[it] }
+        val tickToTockSamples = tickToTockGaps.average()
         val tockToTickSamples = period - tickToTockSamples
+        val imbalanceSamples = tickToTockSamples - period / 2.0
+        val imbalanceMicros = imbalanceSamples / sampleRate * 1_000_000.0
+        val imbalanceUncertaintyMicros = if (m > 1) {
+            var sumSq = 0.0
+            for (g in tickToTockGaps) { val d = g - tickToTockSamples; sumSq += d * d }
+            val se = sqrt(sumSq / (m * (m - 1).toDouble()))
+            se / sampleRate * 1_000_000.0
+        } else 0.0
         val silenceAfterTick = maxOf(0, (tickToTockSamples - tplWidth).roundToInt())
         val silenceAfterTock = maxOf(0, (tockToTickSamples - tplWidth).roundToInt())
 
@@ -474,6 +486,8 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
             elapsedSamples = totalSamples,
             synced = true,
             method = Method.WAV_REFINED,
+            imbalanceMicros = imbalanceMicros,
+            imbalanceUncertaintyMicros = imbalanceUncertaintyMicros,
         )
     }
 
