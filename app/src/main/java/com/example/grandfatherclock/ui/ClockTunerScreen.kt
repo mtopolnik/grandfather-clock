@@ -46,6 +46,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.grandfatherclock.MainViewModel
+import com.example.grandfatherclock.data.SessionStore
 import com.example.grandfatherclock.ui.theme.IdleGray
 import com.example.grandfatherclock.ui.theme.Orange
 import com.example.grandfatherclock.ui.theme.SyncGreen
@@ -124,10 +125,13 @@ fun ClockTunerScreen(
             verticalArrangement = Arrangement.Center,
         ) {
             // Flashing circle
+            val displayPeriod = if (state.wavPeriodMicros > 0) state.wavPeriodMicros else state.periodMicros
+            val bpm = if (displayPeriod > 0) SessionStore.classifyBpm(displayPeriod) else null
             FlashingCircle(
                 lastBeatIsTick = state.lastBeatIsTick,
                 flashTrigger = state.flashTrigger,
                 synced = state.synced,
+                bpm = bpm,
             )
 
             Spacer(modifier = Modifier.height(40.dp))
@@ -141,6 +145,16 @@ fun ClockTunerScreen(
                     synced = state.synced,
                     isLarge = state.wavPeriodMicros <= 0,
                 )
+                if (state.crystalBiasPpm != 0.0) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    val biasUsPerSec = state.crystalBiasPpm
+                    val sign = if (biasUsPerSec >= 0) "+" else ""
+                    Text(
+                        text = "Crystal bias: ${sign}${String.format(Locale.US, "%.1f", biasUsPerSec)} \u00B5s/s",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f),
+                    )
+                }
             } else if (state.running) {
                 Text(
                     text = "Listening\u2026",
@@ -176,15 +190,6 @@ fun ClockTunerScreen(
                     text = "Beats: ${state.beatCount}",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f),
-                )
-
-                Spacer(modifier = Modifier.height(8.dp))
-
-                val elapsedFormatted = String.format(Locale.US, "%.1f", state.elapsedSeconds)
-                Text(
-                    text = "${elapsedFormatted}s",
-                    style = MaterialTheme.typography.headlineLarge,
-                    color = MaterialTheme.colorScheme.onBackground,
                 )
             }
 
@@ -245,6 +250,20 @@ fun ClockTunerScreen(
                 onMinutesChange = { viewModel.setRecordingMinutes(it) },
             )
 
+            if (state.running || state.elapsedSeconds > 0) {
+                Spacer(modifier = Modifier.height(16.dp))
+                val totalSeconds = state.elapsedSeconds.toInt()
+                val mm = totalSeconds / 60
+                val ss = totalSeconds % 60
+                val tenths = ((state.elapsedSeconds - totalSeconds) * 10).toInt()
+                val elapsedFormatted = String.format(Locale.US, "%02d:%02d.%d", mm, ss, tenths)
+                Text(
+                    text = elapsedFormatted,
+                    style = MaterialTheme.typography.headlineLarge,
+                    color = MaterialTheme.colorScheme.onBackground,
+                )
+            }
+
             if (!state.running && state.wavPath != null) {
                 val dir = state.wavPath!!.substringBeforeLast('/')
                 Spacer(modifier = Modifier.height(16.dp))
@@ -267,9 +286,14 @@ private fun PeriodDisplay(
     synced: Boolean,
     isLarge: Boolean,
 ) {
-    val numFmt = NumberFormat.getNumberInstance(Locale.US).apply {
-        maximumFractionDigits = 0
-    }
+    val bpm = SessionStore.classifyBpm(periodMicros)
+    val idealPeriodMicros = 2.0 * 60_000_000.0 / bpm
+    // positive ppm = clock running fast (short period)
+    val deviationPpm = (idealPeriodMicros - periodMicros) / idealPeriodMicros * 1_000_000.0
+    val uncertaintyPpm = uncertaintyMicros / idealPeriodMicros * 1_000_000.0
+    val sign = if (deviationPpm >= 0) "+" else ""
+    val ppmFmt = String.format(Locale.US, "%.1f", deviationPpm)
+    val uncFmt = String.format(Locale.US, "%.1f", uncertaintyPpm)
 
     Text(
         text = label,
@@ -280,16 +304,16 @@ private fun PeriodDisplay(
     Spacer(modifier = Modifier.height(4.dp))
 
     Text(
-        text = "${numFmt.format(periodMicros)} \u00B5s",
+        text = "${sign}${ppmFmt}\u2009ppm",
         style = if (isLarge) MaterialTheme.typography.displayLarge
                 else MaterialTheme.typography.headlineMedium,
         color = MaterialTheme.colorScheme.onBackground,
     )
 
-    if (uncertaintyMicros > 0) {
+    if (uncertaintyPpm > 0) {
         Spacer(modifier = Modifier.height(4.dp))
         Text(
-            text = "\u00B1 ${numFmt.format(uncertaintyMicros)} \u00B5s",
+            text = "\u00B1 ${uncFmt} ppm",
             style = MaterialTheme.typography.bodyLarge,
             color = if (synced) SyncGreen
                     else MaterialTheme.colorScheme.onBackground.copy(alpha = 0.7f),
@@ -302,6 +326,7 @@ private fun FlashingCircle(
     lastBeatIsTick: Boolean?,
     flashTrigger: Int,
     synced: Boolean,
+    bpm: Int? = null,
 ) {
     var flashColor by remember { mutableStateOf(Color.Transparent) }
 
@@ -331,7 +356,17 @@ private fun FlashingCircle(
             .then(borderModifier)
             .clip(CircleShape)
             .background(animatedColor),
-    )
+        contentAlignment = Alignment.Center,
+    ) {
+        if (bpm != null) {
+            Text(
+                text = "$bpm",
+                fontSize = 32.sp,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onBackground,
+            )
+        }
+    }
 }
 
 @Composable

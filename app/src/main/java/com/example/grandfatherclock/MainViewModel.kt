@@ -46,6 +46,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val analyzing: Boolean = false,
         val wavPath: String? = null,
         val logPath: String? = null,
+        /** Crystal clock bias in ppm (positive = crystal is fast). */
+        val crystalBiasPpm: Double = 0.0,
     )
 
     private val _state = MutableStateFlow(UiState())
@@ -56,6 +58,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var sessionLogger: SessionLogger? = null
     private var wavAnalysisJob: Job? = null
     private var sessionStartTimeMillis: Long = 0L
+    /** Ratio of nominal to actual sample rate — multiply reported periods by this. */
+    private var rateCorrection: Double = 1.0
 
     private val _recordingMinutes = MutableStateFlow(prefs.getInt(KEY_RECORDING_MINUTES, 10))
     val recordingMinutes: StateFlow<Int> = _recordingMinutes.asStateFlow()
@@ -84,10 +88,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         audioCapture = AudioCapture(
             onBuffer = { buffer, count ->
                 val s = tickDetector.process(buffer, count) ?: return@AudioCapture
-                val elapsedSeconds = s.elapsedSamples.toDouble() / AudioCapture.SAMPLE_RATE
+                val capture = audioCapture ?: return@AudioCapture
+                val corr = AudioCapture.SAMPLE_RATE.toDouble() / capture.correctedSampleRate
+                rateCorrection = corr
+                val biasPpm = (capture.correctedSampleRate / AudioCapture.SAMPLE_RATE - 1.0) * 1_000_000.0
+                val elapsedSeconds = s.elapsedSamples.toDouble() / capture.correctedSampleRate
                 _state.value = _state.value.copy(
-                    periodMicros = s.periodMicros,
-                    uncertaintyMicros = s.uncertaintyMicros,
+                    periodMicros = s.periodMicros * corr,
+                    uncertaintyMicros = s.uncertaintyMicros * corr,
                     tickCount = s.tickCount,
                     beatCount = s.beatCount,
                     lastBeatIsTick = if (s.newBeat) s.lastBeatIsTick else _state.value.lastBeatIsTick,
@@ -95,6 +103,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     elapsedSeconds = elapsedSeconds,
                     synced = s.synced,
                     method = s.method,
+                    crystalBiasPpm = biasPpm,
                 )
                 if (elapsedSeconds >= _recordingMinutes.value * 60) {
                     viewModelScope.launch { stop() }
@@ -124,12 +133,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _state.value = _state.value.copy(analyzing = true)
             wavAnalysisJob = viewModelScope.launch(Dispatchers.IO) {
                 val result = tickDetector.analyzeWavFile(wavFile)
+                val corr = rateCorrection
                 if (result != null) {
+                    val correctedPeriod = result.periodMicros * corr
+                    val correctedUncertainty = result.uncertaintyMicros * corr
                     _state.value = _state.value.copy(
-                        wavPeriodMicros = result.periodMicros,
-                        wavUncertaintyMicros = result.uncertaintyMicros,
-                        imbalanceMicros = result.imbalanceMicros,
-                        imbalanceUncertaintyMicros = result.imbalanceUncertaintyMicros,
+                        wavPeriodMicros = correctedPeriod,
+                        wavUncertaintyMicros = correctedUncertainty,
+                        imbalanceMicros = result.imbalanceMicros * corr,
+                        imbalanceUncertaintyMicros = result.imbalanceUncertaintyMicros * corr,
                         analyzing = false,
                     )
                     if (_state.value.elapsedSeconds >= 60.0) {
@@ -137,9 +149,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                             id = sessionStartTimeMillis,
                             startTimeMillis = sessionStartTimeMillis,
                             durationSeconds = _state.value.elapsedSeconds,
-                            periodMicros = result.periodMicros,
-                            uncertaintyMicros = result.uncertaintyMicros,
-                            bpmClass = SessionStore.classifyBpm(result.periodMicros),
+                            periodMicros = correctedPeriod,
+                            uncertaintyMicros = correctedUncertainty,
+                            bpmClass = SessionStore.classifyBpm(correctedPeriod),
                         ))
                     }
                 } else {

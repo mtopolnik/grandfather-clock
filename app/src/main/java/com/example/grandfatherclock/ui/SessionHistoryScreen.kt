@@ -48,7 +48,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.grandfatherclock.data.SessionRecord
 import com.example.grandfatherclock.data.SessionStore
-import java.text.NumberFormat
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -205,9 +204,6 @@ private fun SwipeToDeleteItem(
 @Composable
 private fun SessionRow(record: SessionRecord) {
     val dateFormat = remember { SimpleDateFormat("yyyy-MM-dd  HH:mm", Locale.US) }
-    val numFmt = remember {
-        NumberFormat.getNumberInstance(Locale.US).apply { maximumFractionDigits = 0 }
-    }
 
     val durationMin = (record.durationSeconds / 60).toInt()
     val durationSec = (record.durationSeconds % 60).toInt()
@@ -231,20 +227,21 @@ private fun SessionRow(record: SessionRecord) {
         }
         Spacer(modifier = Modifier.height(4.dp))
         val idealPeriodMicros = 2.0 * 60_000_000.0 / record.bpmClass
-        val deviationMicros = record.periodMicros - idealPeriodMicros
-        val sign = if (deviationMicros >= 0) "+" else ""
+        val deviationPpm = (idealPeriodMicros - record.periodMicros) / idealPeriodMicros * 1_000_000.0
+        val uncertaintyPpm = record.uncertaintyMicros / idealPeriodMicros * 1_000_000.0
+        val sign = if (deviationPpm >= 0) "+" else ""
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.Bottom,
         ) {
             Text(
-                text = "${numFmt.format(record.periodMicros)} (${sign}${numFmt.format(deviationMicros)}) \u00B5s",
+                text = "${sign}${String.format(Locale.US, "%.1f", deviationPpm)} ppm",
                 style = MaterialTheme.typography.headlineSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Text(
-                text = "\u00B1 ${numFmt.format(record.uncertaintyMicros)} \u00B5s",
+                text = "\u00B1 ${String.format(Locale.US, "%.1f", uncertaintyPpm)} ppm",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
             )

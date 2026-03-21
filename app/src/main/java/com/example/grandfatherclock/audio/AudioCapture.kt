@@ -3,6 +3,7 @@ package com.example.grandfatherclock.audio
 import android.annotation.SuppressLint
 import android.media.AudioFormat
 import android.media.AudioRecord
+import android.media.AudioTimestamp
 import android.media.MediaRecorder
 import java.io.File
 import java.io.RandomAccessFile
@@ -28,6 +29,14 @@ class AudioCapture(
     var wavFile: File? = null
         private set
 
+    /**
+     * Actual sample rate measured via AudioTimestamp (system clock vs audio clock).
+     * Falls back to [SAMPLE_RATE] until enough data is collected.
+     */
+    @Volatile
+    var correctedSampleRate: Double = SAMPLE_RATE.toDouble()
+        private set
+
     @SuppressLint("MissingPermission")
     fun start() {
         val minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL, ENCODING)
@@ -42,6 +51,7 @@ class AudioCapture(
         )
 
         totalSamplesRead = 0L
+        correctedSampleRate = SAMPLE_RATE.toDouble()
         recording = true
 
         val readSize = 882 // ~20ms at 44100 Hz — small reads for low-latency detection
@@ -64,11 +74,39 @@ class AudioCapture(
 
             val byteBuffer = ByteBuffer.allocate(bufferSize).order(ByteOrder.LITTLE_ENDIAN)
 
+            // AudioTimestamp tracking for crystal rate correction
+            val ts = AudioTimestamp()
+            var anchorFrame = Long.MIN_VALUE
+            var anchorNanos = 0L
+            var nextTimestampSamples = SAMPLE_RATE.toLong() // first check after ~1s
+
             while (recording) {
                 val read = audioRecord?.read(buffer, 0, buffer.size) ?: -1
                 if (read > 0) {
                     onBuffer(buffer, read)
                     totalSamplesRead += read
+
+                    // Periodically measure actual sample rate via AudioTimestamp
+                    if (totalSamplesRead >= nextTimestampSamples) {
+                        val rec = audioRecord
+                        if (rec != null &&
+                            rec.getTimestamp(ts, AudioTimestamp.TIMEBASE_MONOTONIC)
+                                == AudioRecord.SUCCESS
+                        ) {
+                            if (anchorFrame == Long.MIN_VALUE) {
+                                anchorFrame = ts.framePosition
+                                anchorNanos = ts.nanoTime
+                            } else {
+                                val dFrames = ts.framePosition - anchorFrame
+                                val dNanos = ts.nanoTime - anchorNanos
+                                if (dFrames > 0 && dNanos > 0) {
+                                    correctedSampleRate =
+                                        dFrames.toDouble() / dNanos * 1_000_000_000.0
+                                }
+                            }
+                        }
+                        nextTimestampSamples = totalSamplesRead + SAMPLE_RATE * 5L // re-check every ~5s
+                    }
 
                     // Write to WAV
                     raf?.let { r ->
