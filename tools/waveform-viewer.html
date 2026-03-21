@@ -1,0 +1,599 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Waveform + Beat Viewer</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #1a1a2e; color: #e0e0e0; font-family: 'SF Mono', 'Menlo', monospace; font-size: 13px; overflow: hidden; height: 100vh; display: flex; flex-direction: column; }
+#toolbar { padding: 8px 12px; background: #16213e; display: flex; align-items: center; gap: 12px; flex-shrink: 0; border-bottom: 1px solid #0f3460; }
+#toolbar label { cursor: pointer; padding: 4px 10px; background: #0f3460; border-radius: 4px; }
+#toolbar label:hover { background: #1a5276; }
+#toolbar input[type=file] { display: none; }
+#info { color: #8899aa; flex: 1; }
+#status { color: #e94560; }
+#canvas-wrap { flex: 1; position: relative; overflow: hidden; }
+canvas { display: block; width: 100%; height: 100%; }
+#tooltip { position: absolute; pointer-events: none; background: rgba(15,52,96,0.95); border: 1px solid #e94560; border-radius: 4px; padding: 6px 10px; font-size: 12px; line-height: 1.5; display: none; white-space: nowrap; z-index: 10; }
+#tooltip .label { color: #8899aa; }
+#tooltip .value { color: #e0e0e0; }
+#tooltip .tick { color: #00d2d3; }
+#tooltip .tock { color: #ff9f43; }
+#minimap-wrap { height: 40px; background: #0d1b2a; flex-shrink: 0; position: relative; border-top: 1px solid #0f3460; cursor: pointer; }
+#minimap { width: 100%; height: 100%; }
+#minimap-viewport { position: absolute; top: 0; height: 100%; background: rgba(233,69,96,0.15); border-left: 1px solid #e94560; border-right: 1px solid #e94560; pointer-events: none; }
+#help { position: absolute; bottom: 50px; right: 12px; color: #556677; font-size: 11px; line-height: 1.6; text-align: right; pointer-events: none; }
+</style>
+</head>
+<body>
+<div id="toolbar">
+  <label>Load WAV<input type="file" id="wav-input" accept=".wav"></label>
+  <label>Load beats.json<input type="file" id="beats-input" accept=".json"></label>
+  <span id="info">Load a WAV file and beats.json to begin</span>
+  <span id="status"></span>
+</div>
+<div id="canvas-wrap">
+  <canvas id="canvas"></canvas>
+  <div id="tooltip"></div>
+  <div id="help">
+    Swipe: scroll &nbsp;|&nbsp; Pinch: zoom &nbsp;|&nbsp; Drag: pan<br>
+    Home/End: jump to start/end &nbsp;|&nbsp; Hover beat: show info
+  </div>
+</div>
+<div id="minimap-wrap">
+  <canvas id="minimap"></canvas>
+  <div id="minimap-viewport"></div>
+</div>
+
+<script>
+'use strict';
+
+// ---- State ----
+let samples = null;        // Int16Array - full waveform
+let sampleRate = 44100;
+let beats = [];            // array of beat objects from JSON
+let mipmap = [];           // mipmap[level] = { min: Int16Array, max: Int16Array }
+                           // level 0 = factor 1 (raw), level k = factor 2^k
+
+// View state (in samples)
+let viewStart = 0;         // first visible sample
+let viewEnd = 0;           // last visible sample (exclusive)
+let totalSamples = 0;
+
+// Interaction
+let dragging = false;
+let dragLastX = 0;
+
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const minimapCanvas = document.getElementById('minimap');
+const minimapCtx = minimapCanvas.getContext('2d');
+const tooltip = document.getElementById('tooltip');
+const info = document.getElementById('info');
+const status = document.getElementById('status');
+const minimapViewport = document.getElementById('minimap-viewport');
+const canvasWrap = document.getElementById('canvas-wrap');
+
+// ---- File loading ----
+
+document.getElementById('wav-input').addEventListener('change', e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  status.textContent = 'Loading WAV...';
+  const reader = new FileReader();
+  reader.onload = () => {
+    parseWav(reader.result);
+    status.textContent = '';
+  };
+  reader.readAsArrayBuffer(file);
+});
+
+document.getElementById('beats-input').addEventListener('change', e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    const data = JSON.parse(reader.result);
+    beats = data.beats || [];
+    if (data.sampleRate) sampleRate = data.sampleRate;
+    info.textContent = `${beats.length} beats loaded`;
+    render();
+    renderMinimap();
+  };
+  reader.readAsText(file);
+});
+
+function parseWav(buffer) {
+  const view = new DataView(buffer);
+  // Find 'data' chunk
+  let offset = 12; // skip RIFF header
+  while (offset < buffer.byteLength - 8) {
+    const id = String.fromCharCode(view.getUint8(offset), view.getUint8(offset+1),
+                                    view.getUint8(offset+2), view.getUint8(offset+3));
+    const size = view.getUint32(offset + 4, true);
+    if (id === 'fmt ') {
+      sampleRate = view.getUint32(offset + 12, true);
+    }
+    if (id === 'data') {
+      offset += 8;
+      const numSamples = size / 2; // 16-bit mono
+      samples = new Int16Array(buffer, offset, numSamples);
+      totalSamples = numSamples;
+      break;
+    }
+    offset += 8 + size;
+    if (size % 2 !== 0) offset++; // pad byte
+  }
+
+  if (!samples) {
+    status.textContent = 'Failed to parse WAV';
+    return;
+  }
+
+  viewStart = 0;
+  viewEnd = totalSamples;
+  info.textContent = `${totalSamples} samples (${(totalSamples/sampleRate).toFixed(1)}s) @ ${sampleRate} Hz`;
+
+  status.textContent = 'Building mipmap...';
+  setTimeout(() => {
+    buildMipmap();
+    status.textContent = '';
+    render();
+    renderMinimap();
+  }, 20);
+}
+
+// ---- Mipmap ----
+// Each level halves resolution. Level k has ceil(n / 2^k) entries.
+// We store min and max arrays separately for cache friendliness.
+
+function buildMipmap() {
+  mipmap = [];
+  const n = totalSamples;
+
+  // Level 0: raw samples (reference, no copy)
+  mipmap.push({ min: samples, max: samples, factor: 1 });
+
+  // Build successive levels
+  let prevMin = samples;
+  let prevMax = samples;
+  let prevLen = n;
+
+  for (let level = 1; prevLen > 1; level++) {
+    const len = Math.ceil(prevLen / 2);
+    const newMin = new Int16Array(len);
+    const newMax = new Int16Array(len);
+
+    for (let i = 0; i < len; i++) {
+      const j = i * 2;
+      if (j + 1 < prevLen) {
+        newMin[i] = Math.min(prevMin[j], prevMin[j+1]);
+        newMax[i] = Math.max(prevMax[j], prevMax[j+1]);
+      } else {
+        newMin[i] = prevMin[j];
+        newMax[i] = prevMax[j];
+      }
+    }
+
+    mipmap.push({ min: newMin, max: newMax, factor: 1 << level });
+    prevMin = newMin;
+    prevMax = newMax;
+    prevLen = len;
+
+    // Stop when coarse enough for minimap
+    if (len <= 2000) break;
+  }
+}
+
+// Query min/max for a sample range using the mipmap
+function queryMinMax(startSample, endSample) {
+  const span = endSample - startSample;
+  if (span <= 0) return { min: 0, max: 0 };
+
+  // Pick the coarsest level where factor <= span (so we don't skip data)
+  let level = 0;
+  for (let l = mipmap.length - 1; l >= 0; l--) {
+    if (mipmap[l].factor <= span) {
+      level = l;
+      break;
+    }
+  }
+
+  const m = mipmap[level];
+  const f = m.factor;
+  const iStart = Math.max(0, Math.floor(startSample / f));
+  const iEnd = Math.min(m.min.length, Math.ceil(endSample / f));
+
+  let lo = 32767, hi = -32768;
+  for (let i = iStart; i < iEnd; i++) {
+    if (m.min[i] < lo) lo = m.min[i];
+    if (m.max[i] > hi) hi = m.max[i];
+  }
+  return { min: lo, max: hi };
+}
+
+// ---- Rendering ----
+
+function resizeCanvas() {
+  const dpr = window.devicePixelRatio || 1;
+  const wrap = canvasWrap;
+  canvas.width = wrap.clientWidth * dpr;
+  canvas.height = wrap.clientHeight * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  const mw = document.getElementById('minimap-wrap');
+  minimapCanvas.width = mw.clientWidth * dpr;
+  minimapCanvas.height = mw.clientHeight * dpr;
+  minimapCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
+function render() {
+  if (!samples) return;
+
+  const W = canvasWrap.clientWidth;
+  const H = canvasWrap.clientHeight;
+  const viewSpan = viewEnd - viewStart;
+
+  ctx.clearRect(0, 0, W, H);
+
+  // Waveform
+  const midY = H / 2;
+  const scaleY = (H / 2 - 10) / 32768;
+  const samplesPerPx = viewSpan / W;
+
+  ctx.fillStyle = '#2d6a9f';
+  for (let px = 0; px < W; px++) {
+    const s0 = viewStart + px * samplesPerPx;
+    const s1 = viewStart + (px + 1) * samplesPerPx;
+
+    const { min: lo, max: hi } = queryMinMax(Math.floor(s0), Math.ceil(s1));
+    const y0 = midY - hi * scaleY;
+    const y1 = midY - lo * scaleY;
+    const h = Math.max(1, y1 - y0);
+    ctx.fillRect(px, y0, 1, h);
+  }
+
+  // Zero line
+  ctx.strokeStyle = '#334455';
+  ctx.lineWidth = 0.5;
+  ctx.beginPath();
+  ctx.moveTo(0, midY);
+  ctx.lineTo(W, midY);
+  ctx.stroke();
+
+  // Time axis labels
+  ctx.fillStyle = '#667788';
+  ctx.font = '11px SF Mono, Menlo, monospace';
+  const secPerPx = viewSpan / sampleRate / W;
+  // Choose a nice interval
+  const targetLabelGap = 100; // px
+  const rawInterval = secPerPx * targetLabelGap;
+  const niceIntervals = [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 30, 60];
+  let labelInterval = niceIntervals[niceIntervals.length - 1];
+  for (const ni of niceIntervals) {
+    if (ni >= rawInterval) { labelInterval = ni; break; }
+  }
+
+  const startSec = viewStart / sampleRate;
+  const firstLabel = Math.ceil(startSec / labelInterval) * labelInterval;
+  ctx.textAlign = 'center';
+  for (let t = firstLabel; t * sampleRate < viewEnd; t += labelInterval) {
+    const px = (t * sampleRate - viewStart) / samplesPerPx;
+    ctx.fillStyle = '#334455';
+    ctx.fillRect(px, 0, 1, H);
+    ctx.fillStyle = '#667788';
+    let label;
+    if (labelInterval >= 1) label = t.toFixed(0) + 's';
+    else if (labelInterval >= 0.01) label = t.toFixed(2) + 's';
+    else label = (t * 1000).toFixed(1) + 'ms';
+    ctx.fillText(label, px, H - 4);
+  }
+
+  // Beat markers — real-time (dashed) and refined (solid)
+  for (const beat of beats) {
+    const hasRefined = beat.refined != null;
+
+    // Real-time marker (always shown, dashed if refined exists)
+    const rtPx = (beat.sample - viewStart) / samplesPerPx;
+    if (rtPx >= -20 && rtPx <= W + 20) {
+      const color = beat.isTick ? '#00d2d3' : '#ff9f43';
+      ctx.strokeStyle = color;
+      ctx.lineWidth = hasRefined ? 1 : 1.5;
+      ctx.globalAlpha = hasRefined ? 0.35 : 0.8;
+      ctx.setLineDash(hasRefined ? [4, 4] : []);
+      ctx.beginPath();
+      ctx.moveTo(rtPx, 0);
+      ctx.lineTo(rtPx, H - 16);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.globalAlpha = 1.0;
+
+      if (!hasRefined) {
+        ctx.fillStyle = color;
+        ctx.font = '10px SF Mono, Menlo, monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('#' + beat.index, rtPx, 12);
+      }
+    }
+
+    // Refined marker (solid, brighter)
+    if (hasRefined) {
+      const refPx = (beat.refined - viewStart) / samplesPerPx;
+      if (refPx >= -20 && refPx <= W + 20) {
+        const color = beat.isTick ? '#00ffff' : '#ffbf70';
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2;
+        ctx.globalAlpha = 0.9;
+        ctx.beginPath();
+        ctx.moveTo(refPx, 0);
+        ctx.lineTo(refPx, H - 16);
+        ctx.stroke();
+        ctx.globalAlpha = 1.0;
+
+        ctx.fillStyle = color;
+        ctx.font = '10px SF Mono, Menlo, monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('#' + beat.index, refPx, 12);
+      }
+    }
+
+    // Core detector marker (dot-dash, green/amber)
+    if (beat.coreSample != null) {
+      const corePx = (beat.coreSample - viewStart) / samplesPerPx;
+      if (corePx >= -20 && corePx <= W + 20) {
+        const color = beat.isTick ? '#54d9a0' : '#d9a054';
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1.5;
+        ctx.globalAlpha = 0.8;
+        ctx.setLineDash([2, 3]);
+        ctx.beginPath();
+        ctx.moveTo(corePx, 0);
+        ctx.lineTo(corePx, H - 16);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.globalAlpha = 1.0;
+
+        if (beat.coreOnly) {
+          ctx.fillStyle = color;
+          ctx.font = '10px SF Mono, Menlo, monospace';
+          ctx.textAlign = 'center';
+          ctx.fillText('C', corePx, 12);
+        }
+      }
+    }
+  }
+
+  updateMinimapViewport();
+}
+
+function renderMinimap() {
+  if (!samples) return;
+
+  const W = document.getElementById('minimap-wrap').clientWidth;
+  const H = document.getElementById('minimap-wrap').clientHeight;
+
+  minimapCtx.clearRect(0, 0, W, H);
+
+  const midY = H / 2;
+  const scaleY = (H / 2 - 2) / 32768;
+  const samplesPerPx = totalSamples / W;
+
+  minimapCtx.fillStyle = '#1a4a6e';
+  for (let px = 0; px < W; px++) {
+    const s0 = Math.floor(px * samplesPerPx);
+    const s1 = Math.ceil((px + 1) * samplesPerPx);
+    const { min: lo, max: hi } = queryMinMax(s0, s1);
+    const y0 = midY - hi * scaleY;
+    const y1 = midY - lo * scaleY;
+    minimapCtx.fillRect(px, y0, 1, Math.max(1, y1 - y0));
+  }
+
+  // Beat ticks on minimap
+  for (const beat of beats) {
+    const px = beat.sample / totalSamples * W;
+    minimapCtx.fillStyle = beat.isTick ? 'rgba(0,210,211,0.4)' : 'rgba(255,159,67,0.4)';
+    minimapCtx.fillRect(px, 0, 1, H);
+  }
+
+  updateMinimapViewport();
+}
+
+function updateMinimapViewport() {
+  if (!samples) return;
+  const W = document.getElementById('minimap-wrap').clientWidth;
+  const left = viewStart / totalSamples * W;
+  const right = viewEnd / totalSamples * W;
+  minimapViewport.style.left = left + 'px';
+  minimapViewport.style.width = Math.max(2, right - left) + 'px';
+}
+
+// ---- Interaction ----
+
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  if (!samples) return;
+
+  const viewSpan = viewEnd - viewStart;
+
+  if (e.ctrlKey) {
+    // Pinch-to-zoom (trackpad) or Ctrl+scroll (mouse)
+    const rect = canvas.getBoundingClientRect();
+    const mouseX = e.clientX - rect.left;
+    const W = rect.width;
+    const mouseSample = viewStart + (mouseX / W) * viewSpan;
+
+    const sensitivity = e.shiftKey ? 0.002 : 0.006;
+    const zoom = Math.exp(e.deltaY * sensitivity);
+
+    let newSpan = Math.max(200, Math.min(totalSamples, viewSpan * zoom));
+    const ratio = mouseX / W;
+    let newStart = mouseSample - ratio * newSpan;
+    let newEnd = newStart + newSpan;
+    if (newStart < 0) { newEnd -= newStart; newStart = 0; }
+    if (newEnd > totalSamples) { newStart -= (newEnd - totalSamples); newEnd = totalSamples; }
+    viewStart = Math.max(0, newStart);
+    viewEnd = Math.min(totalSamples, newEnd);
+  } else {
+    // Two-finger swipe: horizontal scroll (deltaX), vertical also scrolls horizontally
+    const dx = e.deltaX !== 0 ? e.deltaX : e.deltaY;
+    const sampleDelta = dx / canvasWrap.clientWidth * viewSpan * 1.5;
+    let newStart = viewStart + sampleDelta;
+    let newEnd = viewEnd + sampleDelta;
+    if (newStart < 0) { newEnd -= newStart; newStart = 0; }
+    if (newEnd > totalSamples) { newStart -= (newEnd - totalSamples); newEnd = totalSamples; }
+    viewStart = Math.max(0, newStart);
+    viewEnd = Math.min(totalSamples, newEnd);
+  }
+
+  render();
+}, { passive: false });
+
+canvas.addEventListener('mousedown', e => {
+  if (e.button !== 0) return;
+  dragging = true;
+  dragLastX = e.clientX;
+  canvas.style.cursor = 'grabbing';
+});
+
+window.addEventListener('mousemove', e => {
+  if (dragging && samples) {
+    const dx = e.clientX - dragLastX;
+    dragLastX = e.clientX;
+    const W = canvasWrap.clientWidth;
+    const viewSpan = viewEnd - viewStart;
+    const sampleDelta = -dx / W * viewSpan;
+
+    let newStart = viewStart + sampleDelta;
+    let newEnd = viewEnd + sampleDelta;
+    if (newStart < 0) { newEnd -= newStart; newStart = 0; }
+    if (newEnd > totalSamples) { newStart -= (newEnd - totalSamples); newEnd = totalSamples; }
+    viewStart = Math.max(0, newStart);
+    viewEnd = Math.min(totalSamples, newEnd);
+    render();
+  }
+
+  // Tooltip on beat hover
+  if (samples && !dragging) {
+    const rect = canvas.getBoundingClientRect();
+    const mouseX = e.clientX - rect.left;
+    const W = rect.width;
+    const viewSpan = viewEnd - viewStart;
+    const mouseSample = viewStart + (mouseX / W) * viewSpan;
+    const hitRadius = viewSpan / W * 8; // 8px tolerance
+
+    let nearest = null;
+    let nearestDist = Infinity;
+    for (const beat of beats) {
+      // Hit-test both real-time and refined positions
+      const rtDist = Math.abs(beat.sample - mouseSample);
+      const refDist = beat.refined != null ? Math.abs(beat.refined - mouseSample) : Infinity;
+      const coreDist = beat.coreSample != null ? Math.abs(beat.coreSample - mouseSample) : Infinity;
+      const dist = Math.min(rtDist, refDist, coreDist);
+      if (dist < hitRadius && dist < nearestDist) {
+        nearest = beat;
+        nearestDist = dist;
+      }
+    }
+
+    if (nearest) {
+      const anchorSample = nearest.refined != null ? nearest.refined : nearest.sample;
+      const px = (anchorSample - viewStart) / viewSpan * W;
+      const typeClass = nearest.isTick ? 'tick' : 'tock';
+      const typeLabel = nearest.isTick ? 'TICK' : 'TOCK';
+      let html =
+        `<span class="${typeClass}">#${nearest.index} ${typeLabel}</span><br>` +
+        `<span class="label">RT position:</span> <span class="value">${nearest.time.toFixed(3)}s (sample ${nearest.sample})</span><br>` +
+        `<span class="label">RT since prev:</span> <span class="value">${nearest.index > 0 ? (nearest.sincePrev * 1000).toFixed(1) + ' ms' : 'N/A'}</span><br>` +
+        `<span class="label">RT avg period:</span> <span class="value">${nearest.index > 0 ? (nearest.avgPeriod * 1000).toFixed(3) + ' ms' : 'N/A'}</span>`;
+      if (nearest.refined != null) {
+        html += `<br><span style="color:#e94560">--- WAV refined ---</span><br>` +
+          `<span class="label">Position:</span> <span class="value">${nearest.refTime.toFixed(6)}s (sample ${nearest.refined.toFixed(1)})</span><br>` +
+          `<span class="label">Since prev:</span> <span class="value">${nearest.refSincePrev > 0 ? (nearest.refSincePrev * 1000).toFixed(3) + ' ms' : 'N/A'}</span><br>` +
+          `<span class="label">Avg period:</span> <span class="value">${nearest.refAvgPeriod > 0 ? (nearest.refAvgPeriod * 1000).toFixed(4) + ' ms' : 'N/A'}</span>`;
+      }
+      if (nearest.coreSample != null) {
+        const coreTime = nearest.coreSample / sampleRate;
+        html += `<br><span style="color:#54d9a0">--- Core detector ---</span><br>` +
+          `<span class="label">Position:</span> <span class="value">${coreTime.toFixed(6)}s (sample ${nearest.coreSample.toFixed(1)})</span>`;
+        if (nearest.coreDetectorScore != null) {
+          html += `<br><span class="label">Detector:</span> <span class="value">${nearest.coreDetectorScore.toFixed(1)}</span>`;
+        }
+        if (nearest.coreCorrelationScore != null) {
+          html += `<br><span class="label">Correlation:</span> <span class="value">${nearest.coreCorrelationScore.toFixed(3)}</span>`;
+        }
+      }
+      tooltip.innerHTML = html;
+      tooltip.style.display = 'block';
+
+      // Position tooltip
+      let tx = rect.left + px + 12;
+      let ty = e.clientY - rect.top + 12;
+      if (tx + tooltip.offsetWidth > rect.right - 4) tx = rect.left + px - tooltip.offsetWidth - 12;
+      if (ty + tooltip.offsetHeight > rect.height - 4) ty = rect.height - tooltip.offsetHeight - 4;
+      tooltip.style.left = (tx - rect.left) + 'px';
+      tooltip.style.top = ty + 'px';
+    } else {
+      tooltip.style.display = 'none';
+    }
+  }
+});
+
+window.addEventListener('mouseup', () => {
+  dragging = false;
+  canvas.style.cursor = '';
+});
+
+// Minimap click/drag to navigate
+const minimapWrap = document.getElementById('minimap-wrap');
+let minimapDragging = false;
+
+function minimapNav(e) {
+  if (!samples) return;
+  const rect = minimapWrap.getBoundingClientRect();
+  const x = (e.clientX - rect.left) / rect.width;
+  const viewSpan = viewEnd - viewStart;
+  let newStart = x * totalSamples - viewSpan / 2;
+  let newEnd = newStart + viewSpan;
+  if (newStart < 0) { newEnd -= newStart; newStart = 0; }
+  if (newEnd > totalSamples) { newStart -= (newEnd - totalSamples); newEnd = totalSamples; }
+  viewStart = Math.max(0, newStart);
+  viewEnd = Math.min(totalSamples, newEnd);
+  render();
+}
+
+minimapWrap.addEventListener('mousedown', e => { minimapDragging = true; minimapNav(e); });
+window.addEventListener('mousemove', e => { if (minimapDragging) minimapNav(e); });
+window.addEventListener('mouseup', () => { minimapDragging = false; });
+
+// Keyboard
+window.addEventListener('keydown', e => {
+  if (!samples) return;
+  const viewSpan = viewEnd - viewStart;
+  if (e.key === 'Home') {
+    viewStart = 0; viewEnd = viewSpan; render();
+  } else if (e.key === 'End') {
+    viewEnd = totalSamples; viewStart = totalSamples - viewSpan; render();
+  } else if (e.key === 'ArrowLeft') {
+    const shift = viewSpan * 0.2;
+    viewStart = Math.max(0, viewStart - shift);
+    viewEnd = viewStart + viewSpan;
+    render();
+  } else if (e.key === 'ArrowRight') {
+    const shift = viewSpan * 0.2;
+    viewEnd = Math.min(totalSamples, viewEnd + shift);
+    viewStart = viewEnd - viewSpan;
+    render();
+  }
+});
+
+// Resize
+window.addEventListener('resize', () => {
+  resizeCanvas();
+  render();
+  renderMinimap();
+});
+
+resizeCanvas();
+</script>
+</body>
+</html>
