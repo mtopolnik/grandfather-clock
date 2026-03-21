@@ -20,7 +20,11 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.History
 import androidx.compose.material3.Button
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface as M3Surface
 import androidx.compose.material3.Text
@@ -83,6 +87,7 @@ fun ClockTunerScreen(
     viewModel: MainViewModel,
     hasPermission: Boolean,
     onRequestPermission: () -> Unit,
+    onShowHistory: () -> Unit = {},
 ) {
     val state by viewModel.state.collectAsState()
     val recordingMinutes by viewModel.recordingMinutes.collectAsState()
@@ -92,6 +97,24 @@ fun ClockTunerScreen(
         modifier = Modifier.fillMaxSize(),
         color = MaterialTheme.colorScheme.background,
     ) {
+        Box(modifier = Modifier.fillMaxSize()) {
+            // History button (top-right)
+            IconButton(
+                onClick = onShowHistory,
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(top = 64.dp, start = 20.dp)
+                    .size(56.dp)
+                    .rotate(if (isUpsideDown) 180f else 0f),
+            ) {
+                Icon(
+                    Icons.Filled.History,
+                    contentDescription = "Session History",
+                    modifier = Modifier.size(40.dp),
+                    tint = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.7f),
+                )
+            }
+
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -232,6 +255,7 @@ fun ClockTunerScreen(
                 )
             }
         }
+        } // Box
     }
 }
 

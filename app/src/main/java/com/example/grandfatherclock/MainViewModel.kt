@@ -7,9 +7,10 @@ import androidx.lifecycle.viewModelScope
 import com.example.grandfatherclock.audio.AudioCapture
 import com.example.grandfatherclock.audio.SessionLogger
 import com.example.grandfatherclock.audio.TickDetector
+import com.example.grandfatherclock.data.SessionRecord
+import com.example.grandfatherclock.data.SessionStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -21,6 +22,7 @@ private const val KEY_RECORDING_MINUTES = "recording_minutes"
 class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val prefs = application.getSharedPreferences("clock_prefs", Context.MODE_PRIVATE)
+    val sessionStore = SessionStore(application)
 
     data class UiState(
         val running: Boolean = false,
@@ -53,7 +55,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val tickDetector = TickDetector()
     private var sessionLogger: SessionLogger? = null
     private var wavAnalysisJob: Job? = null
-    private var autoStopJob: Job? = null
+    private var sessionStartTimeMillis: Long = 0L
 
     private val _recordingMinutes = MutableStateFlow(prefs.getInt(KEY_RECORDING_MINUTES, 10))
     val recordingMinutes: StateFlow<Int> = _recordingMinutes.asStateFlow()
@@ -61,7 +63,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun setRecordingMinutes(minutes: Int) {
         _recordingMinutes.value = minutes.coerceIn(1, 30)
         prefs.edit().putInt(KEY_RECORDING_MINUTES, _recordingMinutes.value).apply()
-        if (_state.value.running) restartAutoStop()
     }
 
     var wavOutputDir: File? = null
@@ -77,11 +78,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         sessionLogger = if (dir != null) SessionLogger(dir) else null
         tickDetector.logger = sessionLogger
 
+        sessionStartTimeMillis = System.currentTimeMillis()
         _state.value = UiState(running = true, logPath = sessionLogger?.filePath)
 
         audioCapture = AudioCapture(
             onBuffer = { buffer, count ->
                 val s = tickDetector.process(buffer, count) ?: return@AudioCapture
+                val elapsedSeconds = s.elapsedSamples.toDouble() / AudioCapture.SAMPLE_RATE
                 _state.value = _state.value.copy(
                     periodMicros = s.periodMicros,
                     uncertaintyMicros = s.uncertaintyMicros,
@@ -89,37 +92,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     beatCount = s.beatCount,
                     lastBeatIsTick = if (s.newBeat) s.lastBeatIsTick else _state.value.lastBeatIsTick,
                     flashTrigger = if (s.newBeat) _state.value.flashTrigger + 1 else _state.value.flashTrigger,
-                    elapsedSeconds = s.elapsedSamples.toDouble() / AudioCapture.SAMPLE_RATE,
+                    elapsedSeconds = elapsedSeconds,
                     synced = s.synced,
                     method = s.method,
                 )
+                if (elapsedSeconds >= _recordingMinutes.value * 60) {
+                    viewModelScope.launch { stop() }
+                }
             },
             wavOutputDir = wavOutputDir,
         )
         audioCapture?.start()
         RecordingService.start(getApplication())
-
-        restartAutoStop()
-    }
-
-    private fun restartAutoStop() {
-        autoStopJob?.cancel()
-        val maxMillis = _recordingMinutes.value * 60 * 1000L
-        val elapsedMillis = (_state.value.elapsedSeconds * 1000).toLong()
-        val remaining = maxMillis - elapsedMillis
-        if (remaining <= 0) {
-            stop()
-        } else {
-            autoStopJob = viewModelScope.launch {
-                delay(remaining)
-                stop()
-            }
-        }
     }
 
     fun stop() {
-        autoStopJob?.cancel()
-        autoStopJob = null
         RecordingService.stop(getApplication())
         audioCapture?.stop()
         val wavFile = audioCapture?.wavFile
@@ -137,16 +124,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _state.value = _state.value.copy(analyzing = true)
             wavAnalysisJob = viewModelScope.launch(Dispatchers.IO) {
                 val result = tickDetector.analyzeWavFile(wavFile)
-                _state.value = if (result != null) {
-                    _state.value.copy(
+                if (result != null) {
+                    _state.value = _state.value.copy(
                         wavPeriodMicros = result.periodMicros,
                         wavUncertaintyMicros = result.uncertaintyMicros,
                         imbalanceMicros = result.imbalanceMicros,
                         imbalanceUncertaintyMicros = result.imbalanceUncertaintyMicros,
                         analyzing = false,
                     )
+                    if (_state.value.elapsedSeconds >= 60.0) {
+                        sessionStore.save(SessionRecord(
+                            id = sessionStartTimeMillis,
+                            startTimeMillis = sessionStartTimeMillis,
+                            durationSeconds = _state.value.elapsedSeconds,
+                            periodMicros = result.periodMicros,
+                            uncertaintyMicros = result.uncertaintyMicros,
+                            bpmClass = SessionStore.classifyBpm(result.periodMicros),
+                        ))
+                    }
                 } else {
-                    _state.value.copy(analyzing = false)
+                    _state.value = _state.value.copy(analyzing = false)
                 }
                 sessionLogger?.close()
                 sessionLogger = null

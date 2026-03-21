@@ -13,12 +13,14 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
 import com.example.grandfatherclock.ui.ClockTunerScreen
+import com.example.grandfatherclock.ui.SessionHistoryScreen
 import com.example.grandfatherclock.ui.theme.GrandfatherClockTheme
 
 class MainActivity : ComponentActivity() {
 
     private val viewModel: MainViewModel by viewModels()
     private var hasPermission by mutableStateOf(false)
+    private var showHistory by mutableStateOf(false)
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -38,13 +40,21 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             GrandfatherClockTheme {
-                ClockTunerScreen(
-                    viewModel = viewModel,
-                    hasPermission = hasPermission,
-                    onRequestPermission = {
-                        permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                    },
-                )
+                if (showHistory) {
+                    SessionHistoryScreen(
+                        sessionStore = viewModel.sessionStore,
+                        onBack = { showHistory = false },
+                    )
+                } else {
+                    ClockTunerScreen(
+                        viewModel = viewModel,
+                        hasPermission = hasPermission,
+                        onRequestPermission = {
+                            permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                        },
+                        onShowHistory = { showHistory = true },
+                    )
+                }
             }
         }
     }
