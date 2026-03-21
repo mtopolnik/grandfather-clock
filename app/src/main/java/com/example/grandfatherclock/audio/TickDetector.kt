@@ -94,12 +94,33 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
 
     // ---- Beat frame positions for period estimation ----
     private val beatFrames = mutableListOf<Int>()
+    private val beatSeqIndices = mutableListOf<Int>()  // sequence index per beat (accounts for missed beats)
+
+    /** Frame indices of all detected beats (each frame = [frameSamples] audio samples). */
+    val detectedBeatFrames: List<Int> get() = beatFrames
+
+    /** Sequence index for each detected beat. Even = tick, odd = tock. Gaps indicate missed beats. */
+    val detectedBeatSequenceIndices: List<Int> get() = beatSeqIndices
+
+    /** Sub-sample-precise positions from WAV refinement, keyed by beat index. */
+    var refinedBeatSamples: Map<Int, Double> = emptyMap()
+        private set
 
     // ---- Period estimation ----
     private var periodMicros = 0.0
     private var uncertaintyMicros = 0.0
     private var method = Method.NONE
     private var synced = false
+
+    /** Current best period estimate in microseconds. */
+    val currentPeriodMicros: Double get() = periodMicros
+    /** Current period uncertainty in microseconds. */
+    val currentUncertaintyMicros: Double get() = uncertaintyMicros
+    /** Tick-to-tock minus ideal half-period, in µs. */
+    var currentImbalanceMicros: Double = 0.0
+        private set
+    var currentImbalanceUncertaintyMicros: Double = 0.0
+        private set
 
     private var estimateCounter = 0
     private val estimateInterval = 168  // ~once per second (168 x 5 ms = 840 ms)
@@ -295,6 +316,12 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
         val preciseA = DoubleArray(groupA.size) { groupA[it] + alignOffsA[it] }
         val preciseB = DoubleArray(groupB.size) { groupB[it] + alignOffsB[it] }
 
+        // Expose refined positions keyed by beat index
+        val refined = mutableMapOf<Int, Double>()
+        for (k in groupAClip.indices) refined[groupAClip[k]] = preciseA[k]
+        for (k in groupBClip.indices) refined[groupBClip[k]] = preciseB[k]
+        refinedBeatSamples = refined
+
         // --- Phase 4: Separate tick/tock regression with outlier rejection ---
         // Fit A (tick) and B (tock) positions independently on a full-period
         // grid, each with its own intercept. This avoids the tick-tock
@@ -409,72 +436,28 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
             "period=%.3f samples (%.1fµs ±%.1fµs) inliers=%d rms=%.2f"
                 .format(period, wavPeriod, wavUncertainty, inlierCount, rmsResidual))
 
-        // --- Phase 5: Write idealized tick-tock WAV ---
-
-        // Split the precise double offsets into integer + fractional parts
-        // for sinc interpolation on raw (undifferenced) clips.
-        val rawClips = readWav(wavFile, beatFrames, clipHalfWidth) ?: return null
-        val amplitudeThreshold = 0.9 * 32767
-
-        fun buildRawTemplate(alignOffsets: DoubleArray, groupClipIdx: List<Int>): ShortArray {
-            val tpl = DoubleArray(tplWidth)
-            for (k in alignOffsets.indices) {
-                val clip = rawClips[groupClipIdx[k]]
-                val intOff = alignOffsets[k].roundToInt()
-                val fracOff = alignOffsets[k] - intOff
-                for (j in 0 until tplWidth) {
-                    var sample = 0.0
-                    val intPos = clipHalfWidth + intOff - tplHalf + j
-                    for (t in -sincHalfLen..sincHalfLen) {
-                        val pos = intPos + t
-                        if (pos in clip.indices) {
-                            val x = t.toDouble() - fracOff
-                            val sincVal = if (abs(x) < 1e-10) 1.0
-                                else sin(PI * x) / (PI * x)
-                            val win = 0.5 * (1.0 + cos(PI * x / sincHalfLen))
-                            sample += clip[pos].toDouble() * sincVal * win
-                        }
-                    }
-                    tpl[j] += sample
-                }
-            }
-            val peak = tpl.maxOf { abs(it) }
-            val scale = if (peak > 0.0) amplitudeThreshold / peak else 1.0
-            return ShortArray(tplWidth) { (tpl[it] * scale).roundToInt().coerceIn(-32768, 32767).toShort() }
-        }
-
-        val rawTickTemplate = buildRawTemplate(alignOffsA, groupAClip)
-        val rawTockTemplate = buildRawTemplate(alignOffsB, groupBClip)
-
-        // Tick-to-tock gap statistics
-        val tickToTockGaps = DoubleArray(m) { preciseB[it] - preciseA[it] }
-        val tickToTockSamples = tickToTockGaps.average()
-        val tockToTickSamples = period - tickToTockSamples
-        val imbalanceSamples = tickToTockSamples - period / 2.0
-        val imbalanceMicros = imbalanceSamples / sampleRate * 1_000_000.0
-        val imbalanceUncertaintyMicros = if (m > 1) {
-            var sumSq = 0.0
-            for (g in tickToTockGaps) { val d = g - tickToTockSamples; sumSq += d * d }
-            val se = sqrt(sumSq / (m * (m - 1).toDouble()))
-            se / sampleRate * 1_000_000.0
-        } else 0.0
-        val silenceAfterTick = maxOf(0, (tickToTockSamples - tplWidth).roundToInt())
-        val silenceAfterTock = maxOf(0, (tockToTickSamples - tplWidth).roundToInt())
-
-        val idealizedFile = File(wavFile.parent, "clock_idealized.wav")
-        writeIdealizedWav(idealizedFile, rawTickTemplate, rawTockTemplate,
-            silenceAfterTick, silenceAfterTock)
-
-        logger?.log("IDEALIZED_WAV",
-            "written to %s tick=%d tock=%d silenceAfterTick=%d silenceAfterTock=%d total=%d samples"
-                .format(idealizedFile.absolutePath, rawTickTemplate.size, rawTockTemplate.size,
-                    silenceAfterTick, silenceAfterTock,
-                    rawTickTemplate.size + silenceAfterTick + rawTockTemplate.size + silenceAfterTock))
-
         periodMicros = wavPeriod
         uncertaintyMicros = wavUncertainty
         method = Method.WAV_REFINED
         synced = true
+
+        // --- Phase 5: Imbalance (tick-to-tock asymmetry) ---
+        val tickToTockGaps = DoubleArray(m) { preciseB[it] - preciseA[it] }
+        val avgGap = tickToTockGaps.average()
+        val imbalanceSamples = avgGap - period / 2.0
+        currentImbalanceMicros = imbalanceSamples / sampleRate * 1_000_000.0
+        currentImbalanceUncertaintyMicros = if (m > 1) {
+            var sumSq = 0.0
+            for (g in tickToTockGaps) { val d = g - avgGap; sumSq += d * d }
+            val se = sqrt(sumSq / (m * (m - 1).toDouble()))
+            se / sampleRate * 1_000_000.0
+        } else 0.0
+        logger?.log("WAV_IMBALANCE",
+            "%.0f ± %.0f µs (%d pairs)"
+                .format(currentImbalanceMicros, currentImbalanceUncertaintyMicros, m))
+
+        // --- Phase 6: Idealized WAV ---
+        writeIdealizedFromWav(wavFile, preciseA, preciseB, period, totalFileSamples)
 
         return State(
             periodMicros = wavPeriod,
@@ -486,9 +469,71 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
             elapsedSamples = totalSamples,
             synced = true,
             method = Method.WAV_REFINED,
-            imbalanceMicros = imbalanceMicros,
-            imbalanceUncertaintyMicros = imbalanceUncertaintyMicros,
+            imbalanceMicros = currentImbalanceMicros,
+            imbalanceUncertaintyMicros = currentImbalanceUncertaintyMicros,
         )
+    }
+
+    private fun writeIdealizedFromWav(
+        wavFile: File,
+        tickPositions: DoubleArray,
+        tockPositions: DoubleArray,
+        periodSamples: Double,
+        totalFileSamples: Int,
+    ) {
+        val tplWidth = sampleRate / 50              // 20ms = 882 samples
+        val tplHalf = tplWidth / 2
+        val amplitudeThreshold = 0.9 * 32767
+
+        fun buildTemplate(positions: DoubleArray): ShortArray {
+            val tpl = DoubleArray(tplWidth)
+            var count = 0
+            RandomAccessFile(wavFile, "r").use { raf ->
+                for (center in positions) {
+                    val centerInt = center.roundToInt()
+                    if (centerInt < tplHalf || centerInt + tplHalf >= totalFileSamples) continue
+                    val clipStart = centerInt - tplHalf
+                    raf.seek(44L + clipStart.toLong() * 2L)
+                    val bytes = ByteArray(tplWidth * 2)
+                    raf.readFully(bytes)
+                    val bb = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+
+                    var energy = 0.0
+                    val window = DoubleArray(tplWidth)
+                    for (j in 0 until tplWidth) {
+                        val s = bb.short.toDouble()
+                        window[j] = s
+                        energy += s * s
+                    }
+                    if (energy <= 1e-12) continue
+                    val scale = 1.0 / sqrt(energy)
+                    for (j in 0 until tplWidth) tpl[j] += window[j] * scale
+                    count++
+                }
+            }
+            if (count < 3) return ShortArray(tplWidth)
+            val peak = tpl.maxOf { abs(it) }
+            val scale = if (peak > 0.0) amplitudeThreshold / peak else 1.0
+            return ShortArray(tplWidth) { (tpl[it] * scale).roundToInt().coerceIn(-32768, 32767).toShort() }
+        }
+
+        val tickTemplate = buildTemplate(tickPositions)
+        val tockTemplate = buildTemplate(tockPositions)
+
+        val tickToTockSamples = if (currentImbalanceMicros != 0.0) {
+            periodSamples / 2.0 + currentImbalanceMicros / 1_000_000.0 * sampleRate
+        } else periodSamples / 2.0
+        val tockToTickSamples = periodSamples - tickToTockSamples
+        val silenceAfterTick = maxOf(0, (tickToTockSamples - tplWidth).roundToInt())
+        val silenceAfterTock = maxOf(0, (tockToTickSamples - tplWidth).roundToInt())
+
+        val idealizedFile = File(wavFile.parent, "clock_idealized.wav")
+        writeIdealizedWav(idealizedFile, tickTemplate, tockTemplate,
+            silenceAfterTick, silenceAfterTock)
+
+        logger?.log("IDEALIZED_WAV",
+            "tick=%d tock=%d silenceAfterTick=%d silenceAfterTock=%d"
+                .format(tickTemplate.size, tockTemplate.size, silenceAfterTick, silenceAfterTock))
     }
 
     fun reset() {
@@ -502,11 +547,15 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
         lastBeatIsTick = true
         lastBeatFrame = -100
         beatFrames.clear()
+        beatSeqIndices.clear()
+        refinedBeatSamples = emptyMap()
         minBeatGapFrames = initialMinBeatGapFrames
         periodMicros = 0.0
         uncertaintyMicros = 0.0
         method = Method.NONE
         synced = false
+        currentImbalanceMicros = 0.0
+        currentImbalanceUncertaintyMicros = 0.0
         estimateCounter = 0
     }
 
@@ -640,13 +689,32 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
             return false
         }
 
+        // Detect missed beat: if we have a stable period and the gap since the
+        // last beat is ~2x the expected half-period, a beat was missed. Increment
+        // beatCount by 2 so tick/tock assignment stays correct.
+        val prevBeatFrame = lastBeatFrame
+        val gap = globalFrame - prevBeatFrame
+        var missed = false
+        if (prevBeatFrame >= 0 && periodMicros > 0 && beatCount >= 10) {
+            val halfPeriodFrames = periodMicros / 1_000_000.0 * sampleRate / frameSamples / 2.0
+            // Gap is ~2x half-period (i.e., ~1 full period) → missed one beat
+            if (gap > halfPeriodFrames * 1.6 && gap < halfPeriodFrames * 2.5) {
+                beatCount++  // extra increment for the missed beat
+                if ((beatCount % 2 == 1)) tickCount++ // missed beat was a tick
+                missed = true
+                logger?.log("MISSED_BEAT",
+                    "gap=%d frames (%.0fms) expected_half=%.0f frames, incrementing beatCount"
+                        .format(gap, gap * frameSamples * 1000.0 / sampleRate, halfPeriodFrames))
+            }
+        }
+
         beatCount++
         lastBeatIsTick = (beatCount % 2 == 1)
         if (lastBeatIsTick) tickCount++
-        val prevBeatFrame = lastBeatFrame
         lastBeatFrame = globalFrame
 
         beatFrames.add(globalFrame)
+        beatSeqIndices.add(beatCount - 1)  // 0-based: even=tick, odd=tock
 
         val beatType = if (lastBeatIsTick) "TICK" else "TOCK"
         val gapFromPrev = if (prevBeatFrame >= 0) {
@@ -654,9 +722,10 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
             "gap=%.0fms".format(gapMs)
         } else "gap=N/A"
         logger?.log("BEAT",
-            "#%d %s t=%.3fs peak=%.0f median=%.0f ratio=%.1f streak=%d %s global_frame=%d"
+            "#%d %s t=%.3fs peak=%.0f median=%.0f ratio=%.1f streak=%d %s global_frame=%d%s"
                 .format(beatCount, beatType, audioTime, peak, median,
-                    peak / maxOf(median, 1.0), streakLen, gapFromPrev, globalFrame))
+                    peak / maxOf(median, 1.0), streakLen, gapFromPrev, globalFrame,
+                    if (missed) " (after missed beat)" else ""))
 
         return true
     }
