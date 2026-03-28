@@ -227,21 +227,21 @@ private fun SessionRow(record: SessionRecord) {
         }
         Spacer(modifier = Modifier.height(4.dp))
         val idealPeriodMicros = 2.0 * 60_000_000.0 / record.bpmClass
-        val deviationPpm = (idealPeriodMicros - record.periodMicros) / idealPeriodMicros * 1_000_000.0
-        val uncertaintyPpm = record.uncertaintyMicros / idealPeriodMicros * 1_000_000.0
-        val sign = if (deviationPpm >= 0) "+" else ""
+        val secPerWeek = (idealPeriodMicros - record.periodMicros) / idealPeriodMicros * 604_800.0
+        val uncSecPerWeek = record.uncertaintyMicros / idealPeriodMicros * 604_800.0
+        val sign = if (secPerWeek >= 0) "+" else ""
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.Bottom,
         ) {
             Text(
-                text = "${sign}${String.format(Locale.US, "%.1f", deviationPpm)} ppm",
+                text = "${sign}${String.format(Locale.US, "%.1f", secPerWeek)} s/week",
                 style = MaterialTheme.typography.headlineSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Text(
-                text = "\u00B1 ${String.format(Locale.US, "%.1f", uncertaintyPpm)} ppm",
+                text = "\u00B1 ${String.format(Locale.US, "%.1f", uncSecPerWeek)} s/week",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
             )

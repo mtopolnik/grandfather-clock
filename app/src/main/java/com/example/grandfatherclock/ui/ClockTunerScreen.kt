@@ -72,7 +72,7 @@ private fun rememberIsUpsideDown(): Boolean {
                 val physicallyFlipped = orientation in 135..225
                 // Only flip our content if the system hasn't already rotated the display
                 @Suppress("DEPRECATION")
-                val displayRotation = context.display?.rotation ?: Surface.ROTATION_0
+                val displayRotation = context.display.rotation ?: Surface.ROTATION_0
                 isUpsideDown = physicallyFlipped && displayRotation == Surface.ROTATION_0
             }
         }
@@ -288,12 +288,12 @@ private fun PeriodDisplay(
 ) {
     val bpm = SessionStore.classifyBpm(periodMicros)
     val idealPeriodMicros = 2.0 * 60_000_000.0 / bpm
-    // positive ppm = clock running fast (short period)
-    val deviationPpm = (idealPeriodMicros - periodMicros) / idealPeriodMicros * 1_000_000.0
-    val uncertaintyPpm = uncertaintyMicros / idealPeriodMicros * 1_000_000.0
-    val sign = if (deviationPpm >= 0) "+" else ""
-    val ppmFmt = String.format(Locale.US, "%.1f", deviationPpm)
-    val uncFmt = String.format(Locale.US, "%.1f", uncertaintyPpm)
+    // positive = clock running fast (short period)
+    val secPerWeek = (idealPeriodMicros - periodMicros) / idealPeriodMicros * 604_800.0
+    val uncSecPerWeek = uncertaintyMicros / idealPeriodMicros * 604_800.0
+    val sign = if (secPerWeek >= 0) "+" else ""
+    val devFmt = String.format(Locale.US, "%.1f", secPerWeek)
+    val uncFmt = String.format(Locale.US, "%.1f", uncSecPerWeek)
 
     Text(
         text = label,
@@ -304,16 +304,16 @@ private fun PeriodDisplay(
     Spacer(modifier = Modifier.height(4.dp))
 
     Text(
-        text = "${sign}${ppmFmt}\u2009ppm",
+        text = "${sign}${devFmt}\u2009s/week",
         style = if (isLarge) MaterialTheme.typography.displayLarge
                 else MaterialTheme.typography.headlineMedium,
         color = MaterialTheme.colorScheme.onBackground,
     )
 
-    if (uncertaintyPpm > 0) {
+    if (uncSecPerWeek > 0) {
         Spacer(modifier = Modifier.height(4.dp))
         Text(
-            text = "\u00B1 ${uncFmt} ppm",
+            text = "± ${uncFmt} s/week",
             style = MaterialTheme.typography.bodyLarge,
             color = if (synced) SyncGreen
                     else MaterialTheme.colorScheme.onBackground.copy(alpha = 0.7f),
