@@ -1,6 +1,7 @@
 package com.example.grandfatherclock.ui
 
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
@@ -31,10 +32,10 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -52,6 +53,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import kotlin.math.roundToInt
+import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -126,6 +128,7 @@ fun SessionHistoryScreen(
                                 sessionStore.delete(record.id)
                                 sessions = sessionStore.loadAll()
                             },
+                            modifier = Modifier.animateItem(),
                         )
                     }
                 }
@@ -138,22 +141,24 @@ fun SessionHistoryScreen(
 private fun SwipeToDeleteItem(
     record: SessionRecord,
     onDelete: () -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     val density = LocalDensity.current
     val thresholdPx = with(density) { 120.dp.toPx() }
-    var offsetX by remember { mutableFloatStateOf(0f) }
+    val offsetX = remember { Animatable(0f) }
+    val scope = rememberCoroutineScope()
     var dismissed by remember { mutableStateOf(false) }
 
     if (dismissed) return
 
     val bgColor by animateColorAsState(
-        targetValue = if (offsetX > thresholdPx / 2) Color(0xFFD32F2F) else Color(0xFF8B0000),
+        targetValue = if (offsetX.value > thresholdPx / 2) Color(0xFFD32F2F) else Color(0xFF8B0000),
         animationSpec = tween(150),
         label = "swipeBg",
     )
 
     Box(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .padding(vertical = 4.dp)
             .clip(RoundedCornerShape(12.dp)),
@@ -172,7 +177,7 @@ private fun SwipeToDeleteItem(
         // Foreground card
         Box(
             modifier = Modifier
-                .offset { IntOffset(offsetX.roundToInt(), 0) }
+                .offset { IntOffset(offsetX.value.roundToInt(), 0) }
                 .fillMaxWidth()
                 .background(
                     MaterialTheme.colorScheme.surfaceVariant,
@@ -181,16 +186,25 @@ private fun SwipeToDeleteItem(
                 .pointerInput(record.id) {
                     detectHorizontalDragGestures(
                         onDragEnd = {
-                            if (offsetX > thresholdPx) {
-                                dismissed = true
-                                onDelete()
+                            if (offsetX.value > thresholdPx) {
+                                scope.launch {
+                                    offsetX.animateTo(1500f, tween(300))
+                                    dismissed = true
+                                    onDelete()
+                                }
                             } else {
-                                offsetX = 0f
+                                scope.launch {
+                                    offsetX.animateTo(0f, tween(200))
+                                }
                             }
                         },
-                        onDragCancel = { offsetX = 0f },
+                        onDragCancel = {
+                            scope.launch { offsetX.animateTo(0f, tween(200)) }
+                        },
                         onHorizontalDrag = { _, dragAmount ->
-                            offsetX = (offsetX + dragAmount).coerceAtLeast(0f)
+                            scope.launch {
+                                offsetX.snapTo((offsetX.value + dragAmount).coerceAtLeast(0f))
+                            }
                         },
                     )
                 }
