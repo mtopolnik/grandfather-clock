@@ -23,6 +23,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val prefs = application.getSharedPreferences("clock_prefs", Context.MODE_PRIVATE)
     val sessionStore = SessionStore(application)
+    val phoneSilencer = PhoneSilencer(application, prefs)
 
     data class UiState(
         val running: Boolean = false,
@@ -67,6 +68,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun setRecordingMinutes(minutes: Int) {
         _recordingMinutes.value = minutes.coerceIn(1, 30)
         prefs.edit().putInt(KEY_RECORDING_MINUTES, _recordingMinutes.value).apply()
+    }
+
+    init {
+        phoneSilencer.restore()
     }
 
     var wavOutputDir: File? = null
@@ -115,12 +120,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         )
         audioCapture?.start()
         RecordingService.start(getApplication())
+        phoneSilencer.silence()
     }
 
     fun stop() {
         // Auto-stop can queue several stop() calls before the first one runs;
         // only the first may close the session logger the WAV analysis uses.
         if (!_state.value.running) return
+        phoneSilencer.restore()
         RecordingService.stop(getApplication())
         audioCapture?.stop()
         val wavFile = audioCapture?.wavFile

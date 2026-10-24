@@ -89,6 +89,8 @@ fun ClockTunerScreen(
     hasPermission: Boolean,
     onRequestPermission: () -> Unit,
     onShowHistory: () -> Unit = {},
+    hasSilenceAccess: Boolean = false,
+    onRequestSilenceAccess: () -> Unit = {},
 ) {
     val state by viewModel.state.collectAsState()
     val recordingMinutes by viewModel.recordingMinutes.collectAsState()
@@ -220,6 +222,21 @@ fun ClockTunerScreen(
                 ) {
                     Text(
                         "Grant Microphone Permission",
+                        fontSize = 20.sp,
+                        fontWeight = FontWeight.Bold,
+                    )
+                }
+            } else if (!hasSilenceAccess && !state.running) {
+                // Silencing the ringer requires Do Not Disturb access
+                Button(
+                    onClick = onRequestSilenceAccess,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(72.dp),
+                    shape = RoundedCornerShape(16.dp),
+                ) {
+                    Text(
+                        "Allow Silencing the Phone",
                         fontSize = 20.sp,
                         fontWeight = FontWeight.Bold,
                     )
