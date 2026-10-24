@@ -8,12 +8,14 @@ import android.media.AudioManager
 private const val KEY_SAVED_RINGER_MODE = "saved_ringer_mode"
 
 /**
- * Switches the ringer to silent (the volume panel's mute setting, with no
- * vibration) for the duration of a recording, so notification sounds and
- * vibration don't disturb the measurement. Alarms and media are unaffected.
+ * Switches the ringer to silent (no sound, no vibration) for the duration of
+ * a recording, so notification sounds and vibration don't disturb the
+ * measurement.
  *
- * Android lets an app enter or leave silent mode only with notification
- * policy access, which the user grants in system settings.
+ * When an app sets silent mode, Android puts it into effect by turning on
+ * Do Not Disturb, so DND shows as active while a recording runs. For the same
+ * reason, an app can enter or leave silent mode only with notification policy
+ * access, which the user grants in system settings.
  *
  * On restore it puts back the ringer mode that was active before, unless the
  * user changed it during the recording. The saved mode is persisted so that a
