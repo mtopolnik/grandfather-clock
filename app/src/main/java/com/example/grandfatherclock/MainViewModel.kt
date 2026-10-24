@@ -49,6 +49,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val logPath: String? = null,
         /** Crystal clock bias in ppm (positive = crystal is fast). */
         val crystalBiasPpm: Double = 0.0,
+        /** Why the last recording ended early, or null if it didn't. */
+        val error: String? = null,
     )
 
     private val _state = MutableStateFlow(UiState())
@@ -86,7 +88,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
         val dir = wavOutputDir
         sessionLogger?.close()
-        sessionLogger = if (dir != null) SessionLogger(dir) else null
+        // The session log is diagnostic, so record without it if it can't be created.
+        sessionLogger = if (dir != null) runCatching { SessionLogger(dir) }.getOrNull() else null
         tickDetector.logger = sessionLogger
 
         sessionStartTimeMillis = System.currentTimeMillis()
@@ -114,6 +117,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 )
                 if (elapsedSeconds >= _recordingMinutes.value * 60) {
                     viewModelScope.launch { stop() }
+                }
+            },
+            onError = { e ->
+                sessionLogger?.log("CAPTURE_ERROR", e.toString())
+                viewModelScope.launch {
+                    if (!_state.value.running) return@launch
+                    _state.value = _state.value.copy(error = e.message ?: e.toString())
+                    stop()
                 }
             },
             wavOutputDir = wavOutputDir,
@@ -144,7 +155,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (wavFile != null && wavFile.exists()) {
             _state.value = _state.value.copy(analyzing = true)
             wavAnalysisJob = viewModelScope.launch(Dispatchers.IO) {
-                val result = tickDetector.analyzeWavFile(wavFile)
+                // A failure here (e.g. storage full when writing the idealized
+                // WAV) costs the refined result but must not crash the app.
+                val result = try {
+                    tickDetector.analyzeWavFile(wavFile)
+                } catch (e: Exception) {
+                    sessionLogger?.log("WAV_ANALYSIS", "Failed: $e")
+                    null
+                }
                 val corr = rateCorrection
                 if (result != null) {
                     val correctedPeriod = result.periodMicros * corr

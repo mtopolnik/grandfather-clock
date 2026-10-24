@@ -20,10 +20,13 @@ class SessionLogger(outputDir: File) {
         log("SESSION", "Started")
     }
 
+    /** Never throws: the log is diagnostic, so a write failure must not end the recording. */
     @Synchronized
     fun log(tag: String, message: String) {
         val elapsed = (System.nanoTime() - startNanos) / 1_000_000_000.0
-        writer.write("[%8.3fs] %-18s %s\n".format(elapsed, tag, message))
+        try {
+            writer.write("[%8.3fs] %-18s %s\n".format(elapsed, tag, message))
+        } catch (_: Exception) {}
     }
 
     @Synchronized

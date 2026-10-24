@@ -264,6 +264,15 @@ fun ClockTunerScreen(
                 }
             }
 
+            state.error?.let { error ->
+                Spacer(modifier = Modifier.height(12.dp))
+                Text(
+                    text = "Recording stopped: $error",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+
             Spacer(modifier = Modifier.height(24.dp))
 
             // Duration selector
