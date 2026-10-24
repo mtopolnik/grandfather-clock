@@ -229,13 +229,18 @@ fun ClockTunerScreen(
                     onClick = {
                         if (state.running) viewModel.stop() else viewModel.start()
                     },
+                    enabled = !state.analyzing,
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(72.dp),
                     shape = RoundedCornerShape(16.dp),
                 ) {
                     Text(
-                        if (state.running) "Stop" else "Start",
+                        when {
+                            state.running -> "Stop"
+                            state.analyzing -> "Analyzing\u2026"
+                            else -> "Start"
+                        },
                         fontSize = 24.sp,
                         fontWeight = FontWeight.Bold,
                     )

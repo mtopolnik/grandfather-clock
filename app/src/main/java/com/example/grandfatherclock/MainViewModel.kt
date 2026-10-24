@@ -72,7 +72,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     var wavOutputDir: File? = null
 
     fun start() {
-        if (_state.value.running) return
+        // The WAV analysis reads the recording file and the TickDetector state,
+        // both of which a new session overwrites, so it must finish first.
+        if (_state.value.running || _state.value.analyzing) return
 
         wavAnalysisJob?.cancel()
         tickDetector.reset()
@@ -116,6 +118,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun stop() {
+        // Auto-stop can queue several stop() calls before the first one runs;
+        // only the first may close the session logger the WAV analysis uses.
+        if (!_state.value.running) return
         RecordingService.stop(getApplication())
         audioCapture?.stop()
         val wavFile = audioCapture?.wavFile
