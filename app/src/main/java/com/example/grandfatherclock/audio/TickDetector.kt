@@ -1,9 +1,5 @@
 package com.example.grandfatherclock.audio
 
-import java.io.File
-import java.io.RandomAccessFile
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
@@ -32,9 +28,6 @@ import kotlin.math.sqrt
  *    escape wheel's per-tooth pattern, slow drift over minutes), so the formal
  *    least-squares error is combined with a slow-wander term estimated from the
  *    smoothed residuals.
- *
- * [analyzeWavFile] refines the tracked beats to sub-sample precision by template
- * matching on the saved recording, then refits.
  */
 class TickDetector(
     private val sampleRate: Int = AudioCapture.SAMPLE_RATE,
@@ -43,8 +36,6 @@ class TickDetector(
 ) {
 
     var logger: SessionLogger? = null
-
-    enum class Method { NONE, LIVE, WAV_REFINED }
 
     /** One beat for the timing trace: its offset from the fitted straight line. */
     data class TracePoint(
@@ -68,7 +59,6 @@ class TickDetector(
         val newBeat: Boolean = false,
         val elapsedSamples: Long = 0,
         val synced: Boolean = false,
-        val method: Method = Method.NONE,
         /** Tick-to-tock gap minus half the period, in µs. */
         val imbalanceMicros: Double = 0.0,
         val imbalanceUncertaintyMicros: Double = 0.0,
@@ -143,10 +133,6 @@ class TickDetector(
     /** All tracked beats, in time order. */
     val detectedBeats: List<Beat> get() = beats
 
-    /** Sub-sample positions from [analyzeWavFile], keyed by index into [detectedBeats]. */
-    var refinedBeatSamples: Map<Int, Double> = emptyMap()
-        private set
-
     // ---- Published estimate ----
     private var fit: Fit? = null
     private var periodMicros = 0.0
@@ -199,7 +185,6 @@ class TickDetector(
         lastFlashHop = -1_000_000; flashParity = 1
         tickCount = 0
         restartAcquisition()
-        refinedBeatSamples = emptyMap()
     }
 
     // ================================================================
@@ -235,7 +220,6 @@ class TickDetector(
         newBeat = newBeat,
         elapsedSamples = totalSamples,
         synced = synced,
-        method = if (periodMicros > 0) Method.LIVE else Method.NONE,
         imbalanceMicros = imbalanceMicros,
         imbalanceUncertaintyMicros = imbalanceUncertaintyMicros,
         listening = !locked,
@@ -822,135 +806,6 @@ class TickDetector(
         val p = sxy / sxx
         if (p <= 0) return null
         return doubleArrayOf(tm[0] - p * km[0], tm[1] - p * km[1], p)
-    }
-
-    // ================================================================
-    //  Full-recording refinement
-    // ================================================================
-
-    /**
-     * Refines every tracked beat to sub-sample precision by aligning it to an
-     * average template of its beat type in the saved recording, then refits.
-     */
-    fun analyzeWavFile(wavFile: File): State? {
-        if (beats.size < 8 || periodMicros <= 0) return null
-        val pre = (0.002 * sampleRate).toInt()
-        val post = (0.015 * sampleRate).toInt()
-        val search = (0.002 * sampleRate).toInt()
-        val width = pre + post
-        val clipHalf = pre + post + search + 2
-        val centers = IntArray(beats.size) { beats[it].sample.roundToInt() }
-        val clips = readDiffClips(wavFile, centers, clipHalf) ?: return null
-
-        fun window(clip: ShortArray, off: Int): DoubleArray =
-            DoubleArray(width) { j -> clip[clipHalf - pre + off + j].toDouble() }
-
-        fun correlation(tpl: DoubleArray, clip: ShortArray, off: Int): Double {
-            var dot = 0.0; var e = 1e-12
-            for (j in 0 until width) {
-                val s = clip[clipHalf - pre + off + j].toDouble()
-                dot += tpl[j] * s; e += s * s
-            }
-            return dot / sqrt(e)
-        }
-
-        fun bestOffset(tpl: DoubleArray, clip: ShortArray, around: Int, radius: Int): Int {
-            var best = around; var bestScore = Double.NEGATIVE_INFINITY
-            for (off in maxOf(-search, around - radius)..minOf(search, around + radius)) {
-                val sc = correlation(tpl, clip, off)
-                if (sc > bestScore) { bestScore = sc; best = off }
-            }
-            return best
-        }
-
-        fun template(members: List<Int>, offsets: IntArray): DoubleArray {
-            val tpl = DoubleArray(width)
-            for (i in members) {
-                val win = window(clips[i], offsets[i])
-                val norm = sqrt(win.sumOf { it * it })
-                if (norm > 1e-9) for (j in 0 until width) tpl[j] += win[j] / norm
-            }
-            val norm = sqrt(tpl.sumOf { it * it })
-            if (norm > 1e-9) for (j in 0 until width) tpl[j] /= norm
-            return tpl
-        }
-
-        val offsets = IntArray(beats.size)
-        val precise = DoubleArray(beats.size)
-        for (parity in 0..1) {
-            val members = beats.indices.filter { beats[it].parity == parity }
-            if (members.size < 3) return null
-            // The first alignment searches the full range; later ones only refine
-            // around the previous offset, which keeps long recordings fast.
-            val fine = (0.0003 * sampleRate).toInt()
-            var tpl = template(members, offsets)
-            for (i in members) offsets[i] = bestOffset(tpl, clips[i], 0, search)
-            tpl = template(members, offsets)
-            for (i in members) offsets[i] = bestOffset(tpl, clips[i], offsets[i], fine)
-            tpl = template(members, offsets)
-            for (i in members) {
-                val o = bestOffset(tpl, clips[i], offsets[i], fine)
-                val frac = if (abs(o) < search) parabolicOffset(
-                    correlation(tpl, clips[i], o - 1), correlation(tpl, clips[i], o),
-                    correlation(tpl, clips[i], o + 1)) else 0.0
-                precise[i] = centers[i] + o + frac
-            }
-        }
-        refinedBeatSamples = beats.indices.associateWith { precise[it] }
-
-        val f = fitBeats(beats.map { it.k }, beats.map { it.parity }, precise.toList(),
-            ClockProfile.forPeriod(model[2] / sampleRate, profiles), toothConfirmed) ?: return null
-        val toMicros = 1e6 / sampleRate
-        logger?.log("WAV_RESULT", "period=%.1fµs ±%.1fµs imbalance=%.0f±%.0fµs inliers=%d/%d rms=%.2fms"
-            .format(f.period * toMicros, f.periodSigma * toMicros, f.imbalance * toMicros,
-                f.imbalanceSigma * toMicros, f.inliers, beats.size, f.residualSigma * 1000 / sampleRate))
-        return State(
-            periodMicros = f.period * toMicros,
-            uncertaintyMicros = f.periodSigma * toMicros,
-            tickCount = tickCount,
-            beatCount = beats.size,
-            elapsedSamples = totalSamples,
-            synced = true,
-            method = Method.WAV_REFINED,
-            imbalanceMicros = f.imbalance * toMicros,
-            imbalanceUncertaintyMicros = f.imbalanceSigma * toMicros,
-            listening = false,
-            beatsExpected = slotsExamined,
-            recognisedClock = f.recognised,
-        )
-    }
-
-    /**
-     * Reads a clip of 2·[clipHalf] samples centred on each position, as
-     * sample-to-sample differences (which emphasise the tick's high frequencies).
-     */
-    private fun readDiffClips(file: File, centers: IntArray, clipHalf: Int): Array<ShortArray>? = try {
-        RandomAccessFile(file, "r").use { raf ->
-            val total = ((raf.length() - 44) / 2).toInt()
-            val size = 2 * clipHalf
-            Array(centers.size) { i ->
-                val clip = ShortArray(size)
-                val start = centers[i] - clipHalf
-                val from = maxOf(0, start - 1)
-                val to = minOf(total, start + size)
-                if (to > from + 1) {
-                    raf.seek(44L + from.toLong() * 2)
-                    val bytes = ByteArray((to - from) * 2)
-                    raf.readFully(bytes)
-                    val bb = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
-                    var prev = bb.short.toInt()
-                    for (p in from + 1 until to) {
-                        val s = bb.short.toInt()
-                        val idx = p - start
-                        if (idx in 0 until size) clip[idx] = (s - prev).coerceIn(-32768, 32767).toShort()
-                        prev = s
-                    }
-                }
-                clip
-            }
-        }
-    } catch (_: Exception) {
-        null
     }
 
     // ================================================================

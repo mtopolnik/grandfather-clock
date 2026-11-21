@@ -13,11 +13,11 @@ import com.example.grandfatherclock.data.RecordingArchive
 import com.example.grandfatherclock.data.SessionRecord
 import com.example.grandfatherclock.data.SessionStore
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.File
 import java.time.Instant
@@ -60,14 +60,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val flashTrigger: Int = 0,
         val elapsedSeconds: Double = 0.0,
         val synced: Boolean = false,
-        val method: TickDetector.Method = TickDetector.Method.NONE,
-        /** WAV-refined period (template matching on full recording). */
-        val wavPeriodMicros: Double = 0.0,
-        val wavUncertaintyMicros: Double = 0.0,
         /** Tick-to-tock minus ideal half-period, in µs. */
         val imbalanceMicros: Double = 0.0,
         val imbalanceUncertaintyMicros: Double = 0.0,
-        val analyzing: Boolean = false,
         val wavPath: String? = null,
         val logPath: String? = null,
         /** Crystal clock bias in ppm (positive = crystal is fast). */
@@ -82,7 +77,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var audioCapture: AudioCapture? = null
     private val tickDetector = TickDetector()
     private var sessionLogger: SessionLogger? = null
-    private var wavAnalysisJob: Job? = null
     private var sessionStartTimeMillis: Long = 0L
     /** Folder holding the current or most recent session's files. */
     private var sessionDir: File? = null
@@ -108,11 +102,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     var replaySpeed: Double = 1.0
 
     fun start() {
-        // The WAV analysis reads the recording file and the TickDetector state,
-        // both of which a new session overwrites, so it must finish first.
-        if (_state.value.running || _state.value.analyzing) return
+        if (_state.value.running) return
 
-        wavAnalysisJob?.cancel()
         tickDetector.reset()
 
         sessionStartTimeMillis = System.currentTimeMillis()
@@ -158,7 +149,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     flashTrigger = if (s.newBeat) _state.value.flashTrigger + 1 else _state.value.flashTrigger,
                     elapsedSeconds = elapsedSeconds,
                     synced = s.synced,
-                    method = s.method,
                     crystalBiasPpm = biasPpm,
                 )
                 if (elapsedSeconds >= _recordingMinutes.value * 60) {
@@ -184,67 +174,39 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun stop() {
         // Auto-stop can queue several stop() calls before the first one runs;
-        // only the first may close the session logger the WAV analysis uses.
+        // only the first may end the session.
         if (!_state.value.running) return
         phoneSilencer.restore()
         RecordingService.stop(getApplication())
+        // Joins the capture thread, so the detector has seen its last buffer.
         audioCapture?.stop()
-        val wavFile = audioCapture?.wavFile
-        val path = wavFile?.absolutePath
         val dir = sessionDir
-        audioCapture = null
         _state.value = _state.value.copy(
             running = false,
             lastBeatIsTick = null,
-            wavPath = path,
+            wavPath = audioCapture?.wavFile?.absolutePath,
         )
+        audioCapture = null
+        sessionLogger?.close()
+        sessionLogger = null
+        tickDetector.logger = null
 
-        sessionLogger?.flush()
-
-        if (wavFile != null && wavFile.exists()) {
-            _state.value = _state.value.copy(analyzing = true)
-            wavAnalysisJob = viewModelScope.launch(Dispatchers.IO) {
-                // A failure here costs the refined result but must not crash the app.
-                val result = try {
-                    tickDetector.analyzeWavFile(wavFile)
-                } catch (e: Exception) {
-                    sessionLogger?.log("WAV_ANALYSIS", "Failed: $e")
-                    null
-                }
-                val corr = rateCorrection
-                if (result != null) {
-                    val correctedPeriod = result.periodMicros * corr
-                    val correctedUncertainty = result.uncertaintyMicros * corr
-                    _state.value = _state.value.copy(
-                        wavPeriodMicros = correctedPeriod,
-                        wavUncertaintyMicros = correctedUncertainty,
-                        imbalanceMicros = result.imbalanceMicros * corr,
-                        imbalanceUncertaintyMicros = result.imbalanceUncertaintyMicros * corr,
-                    )
-                    if (_state.value.elapsedSeconds >= 60.0) {
-                        sessionStore.save(SessionRecord(
-                            id = sessionStartTimeMillis,
-                            startTimeMillis = sessionStartTimeMillis,
-                            durationSeconds = _state.value.elapsedSeconds,
-                            periodMicros = correctedPeriod,
-                            uncertaintyMicros = correctedUncertainty,
-                            bpmClass = SessionStore.classifyBpm(correctedPeriod),
-                        ))
-                    }
-                }
-                sessionLogger?.close()
-                sessionLogger = null
-                tickDetector.logger = null
-                if (dir != null) archiveSession(dir)
-                // Start stays blocked until this point, so a new session can't have
-                // its logger closed or its state overwritten by this job.
-                _state.value = _state.value.copy(analyzing = false)
+        // The live estimate at stop is the session's result: it fits every beat heard.
+        val result = _state.value
+        val startTimeMillis = sessionStartTimeMillis
+        val measuredSampleRate = AudioCapture.SAMPLE_RATE / rateCorrection
+        viewModelScope.launch(Dispatchers.IO) {
+            if (result.periodMicros > 0 && result.elapsedSeconds >= 60.0) {
+                sessionStore.save(SessionRecord(
+                    id = startTimeMillis,
+                    startTimeMillis = startTimeMillis,
+                    durationSeconds = result.elapsedSeconds,
+                    periodMicros = result.periodMicros,
+                    uncertaintyMicros = result.uncertaintyMicros,
+                    bpmClass = SessionStore.classifyBpm(result.periodMicros),
+                ))
             }
-        } else {
-            sessionLogger?.close()
-            sessionLogger = null
-            tickDetector.logger = null
-            if (dir != null) viewModelScope.launch(Dispatchers.IO) { archiveSession(dir) }
+            if (dir != null) archiveSession(dir, result, startTimeMillis, measuredSampleRate)
         }
     }
 
@@ -253,14 +215,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * measured beat rate to the folder name, so sessions of different clocks are
      * easy to tell apart. A failure here costs only the label and the summary.
      */
-    private fun archiveSession(dir: File) {
-        val s = _state.value
-        val period = if (s.wavPeriodMicros > 0) s.wavPeriodMicros else s.periodMicros
-        val bpm = if (period > 0) SessionStore.classifyBpm(period) else null
+    private suspend fun archiveSession(
+        dir: File, s: UiState, startTimeMillis: Long, measuredSampleRate: Double,
+    ) {
+        val bpm = if (s.periodMicros > 0) SessionStore.classifyBpm(s.periodMicros) else null
         val finalDir = try {
             val info = JSONObject().apply {
                 put("startTime", OffsetDateTime.ofInstant(
-                    Instant.ofEpochMilli(sessionStartTimeMillis), ZoneId.systemDefault()).toString())
+                    Instant.ofEpochMilli(startTimeMillis), ZoneId.systemDefault()).toString())
                 put("durationSeconds", s.elapsedSeconds)
                 if (bpm != null) {
                     put("bpm", bpm)
@@ -268,14 +230,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 s.recognisedClock?.let { put("recognisedClock", it.name) }
                 put("beatCount", s.beatCount)
-                put("realtimePeriodMicros", s.periodMicros)
-                put("realtimeUncertaintyMicros", s.uncertaintyMicros)
-                put("wavPeriodMicros", s.wavPeriodMicros)
-                put("wavUncertaintyMicros", s.wavUncertaintyMicros)
+                put("periodMicros", s.periodMicros)
+                put("uncertaintyMicros", s.uncertaintyMicros)
                 put("imbalanceMicros", s.imbalanceMicros)
                 put("imbalanceUncertaintyMicros", s.imbalanceUncertaintyMicros)
                 // The WAV header always says 44100 Hz; this is the rate the app measured.
-                put("measuredSampleRate", AudioCapture.SAMPLE_RATE / rateCorrection)
+                put("measuredSampleRate", measuredSampleRate)
                 put("crystalBiasPpm", s.crystalBiasPpm)
                 put("device", "${Build.MANUFACTURER} ${Build.MODEL}")
                 s.error?.let { put("error", it) }
@@ -285,7 +245,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         } catch (e: Exception) {
             dir
         }
-        if (finalDir != dir) {
+        if (finalDir == dir) return
+        withContext(Dispatchers.Main) {
+            // A session started meanwhile owns the paths shown.
+            if (sessionDir != dir) return@withContext
             _state.value = _state.value.copy(
                 wavPath = s.wavPath?.let { File(finalDir, File(it).name).absolutePath },
                 logPath = s.logPath?.let { File(finalDir, File(it).name).absolutePath },
@@ -294,7 +257,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     override fun onCleared() {
-        wavAnalysisJob?.cancel()
         stop()
         super.onCleared()
     }

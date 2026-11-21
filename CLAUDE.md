@@ -12,7 +12,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Testing
 
-`TickDetectorSimulationTest.simulateFromWav` replays a real WAV recording through `TickDetector`, running both real-time beat detection and WAV-refined analysis. It requires a clock recording WAV file.
+`TickDetectorSimulationTest.simulateFromWav` replays a real WAV recording through `TickDetector` and prints the result. It requires a clock recording WAV file.
 
 ```bash
 # Point WAV_FILE at a recording pulled from the device:
@@ -42,7 +42,7 @@ adb shell am start -n com.example.grandfatherclock/.MainActivity \
   --es replay_wav /sdcard/Android/data/com.example.grandfatherclock/files/x.wav --ef replay_speed 4
 ```
 
-Each session is kept in its own folder under `files/recordings/`, named after its local start time. Once the analysis has run, the folder name also carries the clock: its name for a known clock (e.g. `2026-11-21_14-30-05_Nattich`), otherwise the measured beat rate (e.g. `2026-11-21_14-30-05_81bpm`). A session folder contains `clock_recording.wav`, `session.log`, and `info.json` (start time, duration, measured periods, measured sample rate, device). To pull all sessions from a connected device:
+Each session is kept in its own folder under `files/recordings/`, named after its local start time. When the session ends, the folder name also carries the clock: its name for a known clock (e.g. `2026-11-21_14-30-05_Nattich`), otherwise the measured beat rate (e.g. `2026-11-21_14-30-05_81bpm`). A session folder contains `clock_recording.wav`, `session.log`, and `info.json` (start time, duration, measured period and imbalance, measured sample rate, device). To pull all sessions from a connected device:
 
 ```bash
 adb pull /storage/emulated/0/Android/data/com.example.grandfatherclock/files/recordings /dest/
@@ -68,7 +68,6 @@ Single-activity, single-screen app with three layers:
     2. Acquire: autocorrelate the onset strength, then fold the onsets at half/equal/double the candidate period. The period is the shortest candidate whose fold shows a tick/tock pair 40–60% of a period apart, each heard in ≥60% of periods; two consecutive attempts must agree.
     3. Track: examine each predicted beat slot (per beat type, following recent offsets) and take the strongest onset in a ±25–60 ms window; quiet slots are missed beats.
     4. Fit t = a[tick|tock] + P·k by robust least squares. The uncertainty adds a slow-wander term to the formal error, because beat timing wanders in a correlated way (escape-wheel pattern of about ±14 ms per tooth, slow drift over minutes).
-    5. `analyzeWavFile` refines beats by per-type template matching on the saved WAV and refits.
   - **`ClockProfile`** — Known clocks: Nattich (81 BPM, 30-tooth escape wheel, ~3.5 ms wander) and Medusa (104 BPM, 26 teeth, ~6.5 ms wander). Their names label session folders and history tabs. A clock is matched by BPM, then recognised only once its beats confirm the tooth count. After about 1.2 wheel turns, beats of the same tooth must scatter less than half as much as around the straight line, and less than 0.8× as much as with one tooth more or fewer. Recognition holds for the session. A recognised clock gets a per-tooth fit (each tooth its own offset, cancelling the pattern) and its own wander amplitude in the uncertainty; others use the generic fit and a cautious 6 ms. `recognitionNeedsTheRightToothCount` checks that wrong tooth counts are never accepted.
 
 ## Measurement limits
@@ -77,7 +76,7 @@ The clocks' own timing irregularity, not the DSP, limits accuracy. Both clocks r
 
 ## UI
 
-Single Compose screen (`ClockTunerScreen`): flashing circle (teal=tick, orange=tock), live rate in s/week with uncertainty, a status line (finding the beat / beats heard / warnings when the beat can't be found or beats are being missed), beat imbalance, a timegrapher-style trace of each beat's offset from the fitted line, a rate-over-time chart with its uncertainty band, the full-recording result after stop, start/stop, duration selector and elapsed time.
+Single Compose screen (`ClockTunerScreen`): flashing circle (teal=tick, orange=tock), live rate in s/week with uncertainty (labelled "Final" after stop, as the session's result), a status line (finding the beat / beats heard / warnings when the beat can't be found or beats are being missed), beat imbalance, a timegrapher-style trace of each beat's offset from the fitted line, a rate-over-time chart with its uncertainty band, start/stop, duration selector and elapsed time.
 
 ## Key Constants
 

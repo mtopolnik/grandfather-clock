@@ -117,23 +117,6 @@ fun ClockTunerScreen(
         color = MaterialTheme.colorScheme.background,
     ) {
         Box(modifier = Modifier.fillMaxSize()) {
-            // History button (top-right)
-            IconButton(
-                onClick = onShowHistory,
-                modifier = Modifier
-                    .align(Alignment.TopStart)
-                    .padding(top = 64.dp, start = 20.dp)
-                    .size(56.dp)
-                    .rotate(if (isUpsideDown) 180f else 0f),
-            ) {
-                Icon(
-                    Icons.Filled.History,
-                    contentDescription = "Session History",
-                    modifier = Modifier.size(40.dp),
-                    tint = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.7f),
-                )
-            }
-
         BoxWithConstraints(
             modifier = Modifier
                 .fillMaxSize()
@@ -150,8 +133,7 @@ fun ClockTunerScreen(
             verticalArrangement = Arrangement.Center,
         ) {
             // Flashing circle
-            val displayPeriod = if (state.wavPeriodMicros > 0) state.wavPeriodMicros else state.periodMicros
-            val bpm = if (displayPeriod > 0) SessionStore.classifyBpm(displayPeriod) else null
+            val bpm = if (state.periodMicros > 0) SessionStore.classifyBpm(state.periodMicros) else null
             FlashingCircle(
                 lastBeatIsTick = state.lastBeatIsTick,
                 flashTrigger = state.flashTrigger,
@@ -161,14 +143,13 @@ fun ClockTunerScreen(
 
             Spacer(modifier = Modifier.height(24.dp))
 
-            // Live period (shown once available)
+            // Period (shown once available); after stop it is the session's result.
             if (state.periodMicros > 0) {
                 PeriodDisplay(
-                    label = "Live",
+                    label = if (state.running) "Live" else "Final",
                     periodMicros = state.periodMicros,
                     uncertaintyMicros = state.uncertaintyMicros,
                     synced = state.synced,
-                    isLarge = state.wavPeriodMicros <= 0,
                 )
                 if (state.crystalBiasPpm != 0.0) {
                     Spacer(modifier = Modifier.height(4.dp))
@@ -180,26 +161,6 @@ fun ClockTunerScreen(
                         color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f),
                     )
                 }
-            }
-
-            // WAV-refined period (shown after stop, below the real-time value)
-            if (state.wavPeriodMicros > 0) {
-                Spacer(modifier = Modifier.height(24.dp))
-                PeriodDisplay(
-                    label = "Full recording",
-                    periodMicros = state.wavPeriodMicros,
-                    uncertaintyMicros = state.wavUncertaintyMicros,
-                    synced = state.wavUncertaintyMicros / state.wavPeriodMicros * 604_800.0 <=
-                        TickDetector.SYNCED_SEC_PER_WEEK,
-                    isLarge = true,
-                )
-            } else if (state.analyzing) {
-                Spacer(modifier = Modifier.height(24.dp))
-                Text(
-                    text = "Analyzing recording\u2026",
-                    style = MaterialTheme.typography.bodyLarge,
-                    color = MaterialTheme.colorScheme.primary,
-                )
             }
 
             Spacer(modifier = Modifier.height(20.dp))
@@ -283,18 +244,13 @@ fun ClockTunerScreen(
                     onClick = {
                         if (state.running) viewModel.stop() else viewModel.start()
                     },
-                    enabled = !state.analyzing,
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(72.dp),
                     shape = RoundedCornerShape(16.dp),
                 ) {
                     Text(
-                        when {
-                            state.running -> "Stop"
-                            state.analyzing -> "Analyzing\u2026"
-                            else -> "Start"
-                        },
+                        if (state.running) "Stop" else "Start",
                         fontSize = 24.sp,
                         fontWeight = FontWeight.Bold,
                     )
@@ -343,6 +299,24 @@ fun ClockTunerScreen(
             }
         }
         } // BoxWithConstraints
+
+            // History button (top-left). It comes after the scrolling content so it
+            // sits on top and receives taps.
+            IconButton(
+                onClick = onShowHistory,
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(top = 64.dp, start = 20.dp)
+                    .size(56.dp)
+                    .rotate(if (isUpsideDown) 180f else 0f),
+            ) {
+                Icon(
+                    Icons.Filled.History,
+                    contentDescription = "Session History",
+                    modifier = Modifier.size(40.dp),
+                    tint = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.7f),
+                )
+            }
         } // Box
     }
 }
@@ -353,7 +327,6 @@ private fun PeriodDisplay(
     periodMicros: Double,
     uncertaintyMicros: Double,
     synced: Boolean,
-    isLarge: Boolean,
 ) {
     val bpm = SessionStore.classifyBpm(periodMicros)
     val idealPeriodMicros = 2.0 * 60_000_000.0 / bpm
@@ -374,8 +347,7 @@ private fun PeriodDisplay(
 
     Text(
         text = "${sign}${devFmt}\u2009s/week",
-        style = if (isLarge) MaterialTheme.typography.displayLarge
-                else MaterialTheme.typography.headlineMedium,
+        style = MaterialTheme.typography.displayLarge,
         color = MaterialTheme.colorScheme.onBackground,
     )
 

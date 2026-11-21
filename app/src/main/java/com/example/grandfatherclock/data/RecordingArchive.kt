@@ -11,7 +11,7 @@ import java.time.format.DateTimeFormatter
  * session never replaces an earlier one.
  *
  * A session folder is named after its local start time, e.g. `2026-11-21_14-30-05`.
- * Once the analysis has measured the clock, the folder name gains a label: the
+ * When the session ends, the folder name gains a label: the
  * clock's name for a known clock (`2026-11-21_14-30-05_Nattich`), otherwise its
  * beat rate (`2026-11-21_14-30-05_81bpm`).
  */

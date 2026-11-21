@@ -66,7 +66,7 @@ class AudioCapture(
      * capture and reaches [onError] instead of crashing the process.
      */
     private fun replayLoop(source: File) {
-        // The source stands in for the recording, so the analysis after stop reads it.
+        // The source stands in for the recording.
         wavFile = source
         try {
             RandomAccessFile(source, "r").use { input ->

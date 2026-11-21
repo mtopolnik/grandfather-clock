@@ -51,35 +51,26 @@ class TickDetectorSimulationTest {
             offset += count
         }
 
-        // WAV refinement pass
-        val refined = detector.analyzeWavFile(wavFile)
-
         logger.close()
 
         // Write beat positions for the HTML visualization tool
         writeBeatsJson(detector, outputDir)
 
-        println("\n=== Real-time result ===")
+        println("\n=== Result ===")
         if (lastState != null) {
             println("Period:      %.1f µs".format(lastState.periodMicros))
             println("Uncertainty: ±%.1f µs".format(lastState.uncertaintyMicros))
-            println("Beats: ${lastState.beatCount}  Ticks: ${lastState.tickCount}")
-            println("Method: ${lastState.method}  Synced: ${lastState.synced}")
-        }
-        if (refined != null) {
-            println("\n=== WAV-refined result (template match) ===")
-            println("Period:      %.1f µs".format(refined.periodMicros))
-            println("Uncertainty: ±%.1f µs".format(refined.uncertaintyMicros))
-            if (refined.imbalanceMicros != 0.0 || refined.imbalanceUncertaintyMicros != 0.0) {
-                val sign = if (refined.imbalanceMicros >= 0) "+" else "−"
+            println("Beats: ${lastState.beatCount}  Ticks: ${lastState.tickCount}  Synced: ${lastState.synced}")
+            if (lastState.imbalanceMicros != 0.0 || lastState.imbalanceUncertaintyMicros != 0.0) {
+                val sign = if (lastState.imbalanceMicros >= 0) "+" else "−"
                 println("Imbalance:   %s%.0f ± %.0f µs".format(
-                    sign, kotlin.math.abs(refined.imbalanceMicros), refined.imbalanceUncertaintyMicros))
+                    sign, kotlin.math.abs(lastState.imbalanceMicros), lastState.imbalanceUncertaintyMicros))
             }
         }
         println("\nLog: ${outputDir.absolutePath}/session.log")
 
         // Basic sanity: period should be in a plausible grandfather-clock range (0.5–3s)
-        val period = (refined ?: lastState)?.periodMicros ?: 0.0
+        val period = lastState?.periodMicros ?: 0.0
         assert(period in 500_000.0..3_000_000.0) {
             "Period %.0f µs is outside plausible range".format(period)
         }
@@ -92,7 +83,6 @@ class TickDetectorSimulationTest {
     private fun writeBeatsJson(detector: TickDetector, outputDir: File) {
         val sampleRate = 44100
         val beats = detector.detectedBeats
-        val refined = detector.refinedBeatSamples
 
         val outFile = File(outputDir, "beats.json")
         FileWriter(outFile).use { w ->
@@ -104,12 +94,11 @@ class TickDetectorSimulationTest {
                 w.write("{\"sample\":$samplePos,\"time\":%.6f,\"isTick\":%s,\"seqIndex\":%d"
                     .format(beat.sample / sampleRate, beat.parity == 0, 2 * beat.k + beat.parity))
                 w.write(",\"sincePrev\":%.6f,\"snr\":%.1f,\"index\":$i".format(sincePrev, beat.snr))
-                refined[i]?.let { w.write(",\"refined\":%.2f,\"refTime\":%.6f".format(it, it / sampleRate)) }
                 w.write("}")
             }
             w.write("]}")
         }
-        println("Beats JSON: ${outFile.absolutePath} (${refined.size} refined)")
+        println("Beats JSON: ${outFile.absolutePath}")
     }
 
 }

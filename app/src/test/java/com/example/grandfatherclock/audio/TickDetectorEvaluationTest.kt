@@ -52,7 +52,6 @@ class TickDetectorEvaluationTest {
         val checkpoints: List<Checkpoint>,
         val beatCount: Int,
         val finalState: TickDetector.State?,
-        val wavState: TickDetector.State?,
     )
 
     private val checkpointSeconds = listOf(10, 15, 20, 30, 45, 60, 90, 120, 180, 240, 300, 420)
@@ -80,7 +79,7 @@ class TickDetectorEvaluationTest {
             val samples = readWav(File(root, ref.path))
             val logDir = File(projectRoot, "app/build/reports/eval-log").apply { mkdirs() }
             val logger = SessionLogger(logDir)
-            val s = runSession(ref, samples, start, samples.size, null, logger)
+            val s = runSession(ref, samples, start, samples.size, logger)
             logger.close()
             println("Logged ${ref.path}@$start: final ${s.finalState?.periodMicros} µs, beats ${s.beatCount}")
             return
@@ -88,15 +87,14 @@ class TickDetectorEvaluationTest {
 
         val sessions = mutableListOf<Session>()
         for (ref in refs) {
-            val wav = File(root, ref.path)
-            val samples = readWav(wav)
-            sessions += runSession(ref, samples, 0, samples.size, wav)
+            val samples = readWav(File(root, ref.path))
+            sessions += runSession(ref, samples, 0, samples.size)
             if (ref.durationSeconds >= offsetSessionLength + offsetStep) {
                 var start = offsetStep
                 while (start + offsetSessionLength <= ref.durationSeconds) {
                     val from = start * SAMPLE_RATE
                     val to = minOf(samples.size, from + offsetSessionLength * SAMPLE_RATE)
-                    sessions += runSession(ref, samples, start, to, null)
+                    sessions += runSession(ref, samples, start, to)
                     start += offsetStep
                 }
             }
@@ -121,9 +119,9 @@ class TickDetectorEvaluationTest {
         val root = File(System.getenv("EVAL_ROOT")?.takeIf { it.isNotEmpty() }
             ?: "${System.getProperty("user.home")}/Desktop/grandfather-clock")
         val cases = listOf(
-            "recordings/2026-11-21_11-37-38_77bpm/clock_recording.wav" to (81 to 30),
-            "clock_recording.wav" to (81 to 30),
-            "recordings/2026-11-21_11-09-54_104bpm/clock_recording.wav" to (104 to 26),
+            "recordings/2026-11-21_11-37-38_Nattich/clock_recording.wav" to (81 to 30),
+            "Nattich_recording.wav" to (81 to 30),
+            "recordings/2026-11-21_11-09-54_Medusa/clock_recording.wav" to (104 to 26),
         ).filter { File(root, it.first).exists() }
         assumeTrue("Recordings not found under $root", cases.isNotEmpty())
         val failures = mutableListOf<String>()
@@ -177,7 +175,7 @@ class TickDetectorEvaluationTest {
     }
 
     private fun runSession(
-        ref: Reference, samples: ShortArray, startSeconds: Int, endSample: Int, wav: File?,
+        ref: Reference, samples: ShortArray, startSeconds: Int, endSample: Int,
         logger: SessionLogger? = null,
     ): Session {
         val detector = TickDetector()
@@ -204,24 +202,21 @@ class TickDetectorEvaluationTest {
                 nextCp++
             }
         }
-        val wavState = wav?.let { runCatching { detector.analyzeWavFile(it) }.getOrNull() }
-        return Session(ref, startSeconds, checkpoints, last?.beatCount ?: 0, last, wavState)
+        return Session(ref, startSeconds, checkpoints, last?.beatCount ?: 0, last)
     }
 
     private fun buildReport(sessions: List<Session>): String {
         val sb = StringBuilder()
         sb.appendLine("=== Per recording (session from the start) ===")
-        sb.appendLine("%-42s %5s %12s %10s %10s %13s %10s".format(
-            "recording", "dur", "ref µs", "live err", "live ±", "beats/expect", "final-pass"))
+        sb.appendLine("%-42s %5s %12s %10s %10s %13s".format(
+            "recording", "dur", "ref µs", "live err", "live ±", "beats/expect"))
         for (s in sessions.filter { it.startSeconds == 0 }) {
             val f = s.finalState
             val liveErr = if (f != null && f.periodMicros > 0) "%+.1f".format(f.periodMicros - s.ref.periodMicros) else "none"
             val liveUnc = if (f != null && f.periodMicros > 0) "%.1f".format(f.uncertaintyMicros) else "-"
-            val w = s.wavState
-            val wavErr = if (w != null) "%+.1f ±%.1f".format(w.periodMicros - s.ref.periodMicros, w.uncertaintyMicros) else "none"
-            sb.appendLine("%-42s %5.0f %12.1f %10s %10s %6d/%-6d %s".format(
+            sb.appendLine("%-42s %5.0f %12.1f %10s %10s %6d/%-6d".format(
                 s.ref.path.take(42), s.ref.durationSeconds, s.ref.periodMicros, liveErr, liveUnc,
-                s.beatCount, s.ref.beatsExpected, wavErr))
+                s.beatCount, s.ref.beatsExpected))
         }
 
         periodTable(sb, "all sessions", sessions)
