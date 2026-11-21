@@ -76,7 +76,7 @@ The clocks' own timing irregularity, not the DSP, limits accuracy. Both clocks r
 
 ## UI
 
-Single Compose screen (`ClockTunerScreen`): flashing circle (teal=tick, orange=tock), live rate in s/week with uncertainty (labelled "Final" after stop, as the session's result), a status line (finding the beat / beats heard / warnings when the beat can't be found or beats are being missed), beat imbalance, a timegrapher-style trace of each beat's offset from the fitted line, a rate-over-time chart with its uncertainty band, start/stop, duration selector and elapsed time.
+Single Compose screen (`ClockTunerScreen`): flashing circle (teal=tick, orange=tock), live rate in s/week with uncertainty (labelled "Final" after stop, as the session's result), a status line (finding the beat / beats heard / warnings when the beat can't be found or beats are being missed), beat imbalance, a prominent warning when the phone's audio clock is unreliable (see below), a timegrapher-style trace of each beat's offset from the fitted line, a rate-over-time chart with its uncertainty band, start/stop, duration selector and elapsed time.
 
 ## Key Constants
 
@@ -84,5 +84,6 @@ Single Compose screen (`ClockTunerScreen`): flashing circle (teal=tick, orange=t
 - Envelope hop: 44 samples (~1 ms); band 2–10 kHz
 - Acquisition: from 6 s of audio, retried every second, last 20 s used
 - Beat accepted at ≥ 3.5× the local noise floor (median envelope over 1.5 s)
-- "Synced" (green): uncertainty ≤ 10 s/week and ≥ 80% of recent beats heard (`TickDetector.SYNCED_SEC_PER_WEEK`)
+- "Synced" (green): uncertainty ≤ 10 s/week and ≥ 80% of recent beats heard (`TickDetector.SYNCED_SEC_PER_WEEK`), and the audio clock not flagged
+- Audio clock: `AudioCapture` measures the true sample rate from `AudioTimestamp`, and periods are corrected by it (bias is under 2 ppm on the Pixel 9 Pro). After a minute (`RATE_OFFSET_SETTLE_SECONDS`), an offset of ≥ 50 ppm (`SUSPECT_RATE_OFFSET_PPM`), more than any phone clock should have, flags the audio timing as unreliable: the screen shows a warning and never turns green
 - Uncertainty calibration: `WANDER_PRIOR_SECONDS` (6 ms), `UNCERTAINTY_SCALE`, `IMBALANCE_PATTERN_FACTOR`, `IMBALANCE_FLOOR_SECONDS` in `TickDetector`, tuned with the evaluation test

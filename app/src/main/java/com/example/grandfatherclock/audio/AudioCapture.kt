@@ -25,6 +25,20 @@ class AudioCapture(
 ) {
     companion object {
         const val SAMPLE_RATE = 44100
+
+        /**
+         * Phone clocks stay within a few tens of ppm, so a larger offset between
+         * the measured and nominal sample rate means the audio timing itself is
+         * unreliable (resampling, dropped samples). 50 ppm is about 30 s/week.
+         */
+        const val SUSPECT_RATE_OFFSET_PPM = 50.0
+
+        /**
+         * Audio needed before the measured rate offset is trusted. The offset is
+         * measured from a timestamp taken about a second into the recording, and
+         * over a minute even a 1 ms error in that timestamp stays below 17 ppm.
+         */
+        const val RATE_OFFSET_SETTLE_SECONDS = 60.0
         private const val CHANNEL = AudioFormat.CHANNEL_IN_MONO
         private const val ENCODING = AudioFormat.ENCODING_PCM_16BIT
     }

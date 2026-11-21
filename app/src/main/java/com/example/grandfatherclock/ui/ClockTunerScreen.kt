@@ -151,16 +151,11 @@ fun ClockTunerScreen(
                     uncertaintyMicros = state.uncertaintyMicros,
                     synced = state.synced,
                 )
-                if (state.crystalBiasPpm != 0.0) {
-                    Spacer(modifier = Modifier.height(4.dp))
-                    val biasUsPerSec = state.crystalBiasPpm
-                    val sign = if (biasUsPerSec >= 0) "+" else ""
-                    Text(
-                        text = "Crystal bias: ${sign}${String.format(Locale.US, "%.1f", biasUsPerSec)} \u00B5s/s",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f),
-                    )
-                }
+            }
+
+            if (state.audioClockSuspect) {
+                Spacer(modifier = Modifier.height(16.dp))
+                AudioClockWarning(state.crystalBiasPpm)
             }
 
             Spacer(modifier = Modifier.height(20.dp))
@@ -466,6 +461,44 @@ private const val LOCK_PATIENCE_SECONDS = 15.0
 /** Below this share of recent beats heard, the clock counts as hard to hear. */
 private const val MIN_HIT_RATE = 0.8
 private val WarningAmber = Color(0xFFFFB300)
+
+/**
+ * Shown when the phone's audio sample rate is off by more than any phone clock
+ * should be: the audio timing is unreliable, and so is the result.
+ */
+@Composable
+private fun AudioClockWarning(offsetPpm: Double) {
+    val ppm = abs(offsetPpm)
+    val secPerWeek = ppm * 1e-6 * 604_800.0
+    M3Surface(
+        color = MaterialTheme.colorScheme.errorContainer,
+        shape = RoundedCornerShape(12.dp),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Text(
+                text = "Phone audio clock unreliable",
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onErrorContainer,
+                textAlign = TextAlign.Center,
+            )
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                text = String.format(Locale.US,
+                    "Its sample rate is off by %.0f ppm (%.0f s/week), far more than a phone's " +
+                        "should be. The result may be wrong. Disconnect any headset or external " +
+                        "microphone and try again.", ppm, secPerWeek),
+                style = MaterialTheme.typography.bodyLarge,
+                color = MaterialTheme.colorScheme.onErrorContainer,
+                textAlign = TextAlign.Center,
+            )
+        }
+    }
+}
 
 /**
  * One line telling the user whether the app is hearing the clock properly, with

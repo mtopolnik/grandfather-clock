@@ -23,6 +23,7 @@ import java.io.File
 import java.time.Instant
 import java.time.OffsetDateTime
 import java.time.ZoneId
+import kotlin.math.abs
 
 private const val KEY_RECORDING_MINUTES = "recording_minutes"
 
@@ -67,6 +68,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val logPath: String? = null,
         /** Crystal clock bias in ppm (positive = crystal is fast). */
         val crystalBiasPpm: Double = 0.0,
+        /**
+         * The bias is larger than any phone clock should have, so the audio
+         * timing, and with it the result, is unreliable.
+         */
+        val audioClockSuspect: Boolean = false,
         /** Why the last recording ended early, or null if it didn't. */
         val error: String? = null,
     )
@@ -125,6 +131,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 rateCorrection = corr
                 val biasPpm = (capture.correctedSampleRate / AudioCapture.SAMPLE_RATE - 1.0) * 1_000_000.0
                 val elapsedSeconds = s.elapsedSamples.toDouble() / capture.correctedSampleRate
+                val audioClockSuspect = elapsedSeconds >= AudioCapture.RATE_OFFSET_SETTLE_SECONDS &&
+                    abs(biasPpm) >= AudioCapture.SUSPECT_RATE_OFFSET_PPM
                 val prev = _state.value
                 val history = if (s.periodMicros > 0 &&
                     elapsedSeconds - (prev.history.lastOrNull()?.elapsedSeconds ?: 0f) >= 1.0
@@ -148,8 +156,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     lastBeatIsTick = if (s.newBeat) s.lastBeatIsTick else _state.value.lastBeatIsTick,
                     flashTrigger = if (s.newBeat) _state.value.flashTrigger + 1 else _state.value.flashTrigger,
                     elapsedSeconds = elapsedSeconds,
-                    synced = s.synced,
+                    synced = s.synced && !audioClockSuspect,
                     crystalBiasPpm = biasPpm,
+                    audioClockSuspect = audioClockSuspect,
                 )
                 if (elapsedSeconds >= _recordingMinutes.value * 60) {
                     viewModelScope.launch { stop() }
