@@ -6,6 +6,7 @@ import android.os.Build
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.grandfatherclock.audio.AudioCapture
+import com.example.grandfatherclock.audio.BeatLog
 import com.example.grandfatherclock.audio.ClockProfile
 import com.example.grandfatherclock.audio.SessionLogger
 import com.example.grandfatherclock.audio.TickDetector
@@ -26,6 +27,9 @@ import java.time.ZoneId
 import kotlin.math.abs
 
 private const val KEY_RECORDING_MINUTES = "recording_minutes"
+
+/** History points kept for the rate chart; a long session keeps fewer, more widely spaced points. */
+private const val HISTORY_POINTS = 600
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -83,6 +87,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var audioCapture: AudioCapture? = null
     private val tickDetector = TickDetector()
     private var sessionLogger: SessionLogger? = null
+    private var beatLog: BeatLog? = null
     private var sessionStartTimeMillis: Long = 0L
     /** Folder holding the current or most recent session's files. */
     private var sessionDir: File? = null
@@ -93,7 +98,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val recordingMinutes: StateFlow<Int> = _recordingMinutes.asStateFlow()
 
     fun setRecordingMinutes(minutes: Int) {
-        _recordingMinutes.value = minutes.coerceIn(1, 30)
+        _recordingMinutes.value = minutes.coerceIn(DURATION_STEPS_MINUTES.first(), DURATION_STEPS_MINUTES.last())
         prefs.edit().putInt(KEY_RECORDING_MINUTES, _recordingMinutes.value).apply()
     }
 
@@ -120,6 +125,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         // The session log is diagnostic, so record without it if it can't be created.
         sessionLogger = if (dir != null) runCatching { SessionLogger(dir) }.getOrNull() else null
         tickDetector.logger = sessionLogger
+        beatLog?.close()
+        beatLog = if (dir != null) runCatching { BeatLog(dir) }.getOrNull() else null
+        tickDetector.onBeat = beatLog?.let { log -> { beat -> log.write(beat) } }
 
         _state.value = UiState(running = true, logPath = sessionLogger?.filePath)
 
@@ -134,11 +142,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val audioClockSuspect = elapsedSeconds >= AudioCapture.RATE_OFFSET_SETTLE_SECONDS &&
                     abs(biasPpm) >= AudioCapture.SUSPECT_RATE_OFFSET_PPM
                 val prev = _state.value
+                // One point per second at first; the spacing grows with the session,
+                // and every other point is dropped when there are too many, so a
+                // session of hours stays cheap to keep and draw.
+                val spacing = maxOf(1.0, elapsedSeconds / HISTORY_POINTS)
                 val history = if (s.periodMicros > 0 &&
-                    elapsedSeconds - (prev.history.lastOrNull()?.elapsedSeconds ?: 0f) >= 1.0
+                    elapsedSeconds - (prev.history.lastOrNull()?.elapsedSeconds ?: 0f) >= spacing
                 ) {
-                    prev.history + HistoryPoint(
+                    val added = prev.history + HistoryPoint(
                         elapsedSeconds.toFloat(), s.periodMicros * corr, s.uncertaintyMicros * corr)
+                    if (added.size > 2 * HISTORY_POINTS) added.filterIndexed { i, _ -> i % 2 == 0 } else added
                 } else if (s.periodMicros > 0) prev.history else emptyList()
                 _state.value = prev.copy(
                     periodMicros = s.periodMicros * corr,
@@ -196,6 +209,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             wavPath = audioCapture?.wavFile?.absolutePath,
         )
         audioCapture = null
+        tickDetector.onBeat = null
+        beatLog?.close()
+        beatLog = null
         sessionLogger?.close()
         sessionLogger = null
         tickDetector.logger = null
@@ -268,5 +284,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     override fun onCleared() {
         stop()
         super.onCleared()
+    }
+
+    companion object {
+        /**
+         * Recording durations offered, in minutes. A WAV file's 32-bit size
+         * field limits a recording to about 13.5 hours at 44.1 kHz mono 16-bit,
+         * so the longest step is 12 hours (3.8 GB).
+         */
+        val DURATION_STEPS_MINUTES = listOf(
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15, 20, 25, 30, 45,
+            60, 90, 120, 180, 240, 300, 360, 480, 600, 720,
+        )
     }
 }

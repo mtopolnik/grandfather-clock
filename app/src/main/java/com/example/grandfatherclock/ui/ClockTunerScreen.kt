@@ -28,6 +28,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material3.Button
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -273,10 +275,15 @@ fun ClockTunerScreen(
             if (state.running || state.elapsedSeconds > 0) {
                 Spacer(modifier = Modifier.height(16.dp))
                 val totalSeconds = state.elapsedSeconds.toInt()
-                val mm = totalSeconds / 60
+                val hh = totalSeconds / 3600
+                val mm = totalSeconds / 60 % 60
                 val ss = totalSeconds % 60
                 val tenths = ((state.elapsedSeconds - totalSeconds) * 10).toInt()
-                val elapsedFormatted = String.format(Locale.US, "%02d:%02d.%d", mm, ss, tenths)
+                val elapsedFormatted = if (hh > 0) {
+                    String.format(Locale.US, "%d:%02d:%02d.%d", hh, mm, ss, tenths)
+                } else {
+                    String.format(Locale.US, "%02d:%02d.%d", mm, ss, tenths)
+                }
                 Text(
                     text = elapsedFormatted,
                     style = MaterialTheme.typography.headlineLarge,
@@ -406,6 +413,10 @@ private fun FlashingCircle(
     }
 }
 
+/**
+ * The recording duration. The arrows step through [MainViewModel.DURATION_STEPS_MINUTES];
+ * tapping the value opens a menu of common durations.
+ */
 @Composable
 private fun DurationSelector(
     minutes: Int,
@@ -414,6 +425,10 @@ private fun DurationSelector(
     val textColor = Color.White
     val arrowColor = SyncGreen
     val disabledAlpha = 0.25f
+    val steps = MainViewModel.DURATION_STEPS_MINUTES
+    val shorter = steps.lastOrNull { it < minutes }
+    val longer = steps.firstOrNull { it > minutes }
+    var menuOpen by remember { mutableStateOf(false) }
 
     Row(
         verticalAlignment = Alignment.CenterVertically,
@@ -422,26 +437,37 @@ private fun DurationSelector(
         Text(
             text = "\u25C0",
             fontSize = 24.sp,
-            color = if (minutes > 1) arrowColor else arrowColor.copy(alpha = disabledAlpha),
+            color = if (shorter != null) arrowColor else arrowColor.copy(alpha = disabledAlpha),
             modifier = Modifier
-                .clickable(enabled = minutes > 1) { onMinutesChange(minutes - 1) }
+                .clickable(enabled = shorter != null) { shorter?.let(onMinutesChange) }
                 .padding(12.dp),
         )
 
         Spacer(modifier = Modifier.width(4.dp))
 
-        Box(
-            modifier = Modifier
-                .border(1.dp, textColor.copy(alpha = 0.3f), RoundedCornerShape(8.dp))
-                .padding(horizontal = 20.dp, vertical = 8.dp),
-            contentAlignment = Alignment.Center,
-        ) {
-            Text(
-                text = "$minutes min",
-                fontSize = 24.sp,
-                fontWeight = FontWeight.Bold,
-                color = textColor,
-            )
+        Box {
+            Box(
+                modifier = Modifier
+                    .border(1.dp, textColor.copy(alpha = 0.3f), RoundedCornerShape(8.dp))
+                    .clickable { menuOpen = true }
+                    .padding(horizontal = 20.dp, vertical = 8.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = formatDuration(minutes),
+                    fontSize = 24.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = textColor,
+                )
+            }
+            DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                for (m in MENU_DURATIONS_MINUTES) {
+                    DropdownMenuItem(
+                        text = { Text(formatDuration(m), fontSize = 20.sp) },
+                        onClick = { onMinutesChange(m); menuOpen = false },
+                    )
+                }
+            }
         }
 
         Spacer(modifier = Modifier.width(4.dp))
@@ -449,12 +475,21 @@ private fun DurationSelector(
         Text(
             text = "\u25B6",
             fontSize = 24.sp,
-            color = if (minutes < 30) arrowColor else arrowColor.copy(alpha = disabledAlpha),
+            color = if (longer != null) arrowColor else arrowColor.copy(alpha = disabledAlpha),
             modifier = Modifier
-                .clickable(enabled = minutes < 30) { onMinutesChange(minutes + 1) }
+                .clickable(enabled = longer != null) { longer?.let(onMinutesChange) }
                 .padding(12.dp),
         )
     }
+}
+
+/** Durations offered by the menu that opens on tapping the duration, in minutes. */
+private val MENU_DURATIONS_MINUTES = listOf(5, 10, 15, 30, 60, 120, 240, 480, 600, 720)
+
+private fun formatDuration(minutes: Int): String = when {
+    minutes < 60 -> "$minutes min"
+    minutes % 60 == 0 -> "${minutes / 60} h"
+    else -> String.format(Locale.US, "%.1f h", minutes / 60.0)
 }
 
 /** Seconds of listening after which a missing rhythm is reported as a problem. */
@@ -561,14 +596,17 @@ private fun TimingTrace(
             append(", ")
             withStyle(SpanStyle(color = Orange)) { append("tock") }
         }
-        ChartLabel(legend, "±${span.roundToInt()} ms")
+        val tMax = maxOf(elapsedSeconds.toFloat(), trace.last().timeSeconds, 10f)
+        // A long session shows only its latest part, the span the trace covers.
+        val tMin = maxOf(0f, tMax - TickDetector.TRACE_SECONDS)
+        val recent = if (tMin > 0f) " (last ${(TickDetector.TRACE_SECONDS / 60).roundToInt()} min)" else ""
+        ChartLabel(legend, "±${span.roundToInt()} ms$recent")
         Canvas(modifier = Modifier.fillMaxWidth().weight(1f)) {
-            val tMax = maxOf(elapsedSeconds.toFloat(), trace.last().timeSeconds, 10f)
             val mid = size.height / 2
             val r = 1.8.dp.toPx()
             drawLine(axis, Offset(0f, mid), Offset(size.width, mid), strokeWidth = 1.dp.toPx())
             for (p in trace) {
-                val x = p.timeSeconds / tMax * size.width
+                val x = (p.timeSeconds - tMin) / (tMax - tMin) * size.width
                 val y = mid - p.residualMillis.coerceIn(-span, span) / span * (mid - r)
                 val c = when {
                     !p.inlier -> IdleGray

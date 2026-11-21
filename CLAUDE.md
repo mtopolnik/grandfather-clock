@@ -42,7 +42,7 @@ adb shell am start -n com.example.grandfatherclock/.MainActivity \
   --es replay_wav /sdcard/Android/data/com.example.grandfatherclock/files/x.wav --ef replay_speed 4
 ```
 
-Each session is kept in its own folder under `files/recordings/`, named after its local start time. When the session ends, the folder name also carries the clock: its name for a known clock (e.g. `2026-11-21_14-30-05_Nattich`), otherwise the measured beat rate (e.g. `2026-11-21_14-30-05_81bpm`). A session folder contains `clock_recording.wav`, `session.log`, and `info.json` (start time, duration, measured period and imbalance, measured sample rate, device). To pull all sessions from a connected device:
+Each session is kept in its own folder under `files/recordings/`, named after its local start time. When the session ends, the folder name also carries the clock: its name for a known clock (e.g. `2026-11-21_14-30-05_Nattich`), otherwise the measured beat rate (e.g. `2026-11-21_14-30-05_81bpm`). A session folder contains `clock_recording.wav`, `session.log`, `beats.csv` (every beat heard: beat number, type 0 = tick / 1 = tock, position in samples, loudness; divide positions by the measured sample rate for seconds), and `info.json` (start time, duration, measured period and imbalance, measured sample rate, device). Recordings can last up to 12 hours (3.8 GB; a WAV's 32-bit size field allows about 13.5 hours). To pull all sessions from a connected device:
 
 ```bash
 adb pull /storage/emulated/0/Android/data/com.example.grandfatherclock/files/recordings /dest/
@@ -76,12 +76,13 @@ The clocks' own timing irregularity, not the DSP, limits accuracy. Both clocks r
 
 ## UI
 
-Single Compose screen (`ClockTunerScreen`): flashing circle (teal=tick, orange=tock), live rate in s/week with uncertainty (labelled "Final" after stop, as the session's result), a status line (finding the beat / beats heard / warnings when the beat can't be found or beats are being missed), beat imbalance, a prominent warning when the phone's audio clock is unreliable (see below), a timegrapher-style trace of each beat's offset from the fitted line, a rate-over-time chart with its uncertainty band, start/stop, duration selector and elapsed time.
+Single Compose screen (`ClockTunerScreen`): flashing circle (teal=tick, orange=tock), live rate in s/week with uncertainty (labelled "Final" after stop, as the session's result), a status line (finding the beat / beats heard / warnings when the beat can't be found or beats are being missed), beat imbalance, a prominent warning when the phone's audio clock is unreliable (see below), a timegrapher-style trace of each beat's offset from the fitted line, a rate-over-time chart with its uncertainty band, start/stop, duration selector (arrows step through 1 min … 12 h; tapping the value opens a menu of common durations) and elapsed time. In long sessions the timing trace shows the last 10 minutes and the rate chart keeps at most about 1200 points.
 
 ## Key Constants
 
 - Sample rate: 44100 Hz (`AudioCapture.SAMPLE_RATE`)
 - Envelope hop: 44 samples (~1 ms); band 2–10 kHz
+- Audio buffer: 4 s, so a slow refit late in a long session never loses samples. Refits run after every beat up to 2000 beats, then every (beats / 2000)-th beat (`FULL_REFIT_BEATS`)
 - Acquisition: from 6 s of audio, retried every second, last 20 s used
 - Beat accepted at ≥ 3.5× the local noise floor (median envelope over 1.5 s)
 - "Synced" (green): uncertainty ≤ 10 s/week and ≥ 80% of recent beats heard (`TickDetector.SYNCED_SEC_PER_WEEK`), and the audio clock not flagged

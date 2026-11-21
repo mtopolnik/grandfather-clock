@@ -37,6 +37,9 @@ class TickDetector(
 
     var logger: SessionLogger? = null
 
+    /** Called on the audio thread with every beat heard, as soon as it is heard. */
+    var onBeat: ((Beat) -> Unit)? = null
+
     /** One beat for the timing trace: its offset from the fitted straight line. */
     data class TracePoint(
         val timeSeconds: Float,
@@ -68,6 +71,7 @@ class TickDetector(
         val beatsExpected: Int = 0,
         /** Fraction of the most recent beat slots in which a beat was heard. */
         val recentHitRate: Double = 0.0,
+        /** Beats of the last [TRACE_SECONDS], with their offsets from the fitted line. */
         val trace: List<TracePoint> = emptyList(),
         /** The known clock whose escape-wheel pattern the beats confirmed, or null. */
         val recognisedClock: ClockProfile? = null,
@@ -493,13 +497,18 @@ class TickDetector(
             val e0 = env(i - 1).toDouble(); val e1 = env(i).toDouble()
             val frac = if (e1 > e0) ((thr - e0) / (e1 - e0)).coerceIn(0.0, 1.0) else 0.0
             val onset = hopCenter(i - 1 + frac)
-            beats += Beat(k, parity, onset, snr)
+            val beat = Beat(k, parity, onset, snr)
+            beats += beat
+            onBeat?.invoke(beat)
             if (parity == 0) tickCount++
             lastBeatParity = parity
             consecutiveMisses = 0
             recentResiduals[parity][recentResidualCount[parity] % recentResiduals[parity].size] = onset - linePred
             recentResidualCount[parity]++
-            refit()
+            // Each refit costs time in proportion to the beats so far and runs on
+            // the audio thread. Refitting every (beats / FULL_REFIT_BEATS)-th beat
+            // keeps the average cost per beat bounded in sessions lasting hours.
+            if (beats.size % (beats.size / FULL_REFIT_BEATS + 1) == 0) refit()
             logger?.log("BEAT", "k=%d %s t=%.4fs snr=%.1f err=%+.1fms window=±%.0fms".format(
                 k, if (parity == 0) "TICK" else "TOCK", onset / sampleRate, snr,
                 (onset - pred) * 1000 / sampleRate, w * 1000 / sampleRate))
@@ -566,7 +575,11 @@ class TickDetector(
             val secPerWeek = uncertaintyMicros / periodMicros * 604_800.0
             synced = secPerWeek <= SYNCED_SEC_PER_WEEK && recentHitRate() >= 0.8
         }
-        trace = beats.mapIndexed { i, b ->
+        val traceStart = totalSamples - samplesFor(TRACE_SECONDS.toDouble())
+        var first = beats.size
+        while (first > 0 && beats[first - 1].sample >= traceStart) first--
+        trace = (first until beats.size).map { i ->
+            val b = beats[i]
             TracePoint(
                 timeSeconds = (b.sample / sampleRate).toFloat(),
                 residualMillis = ((b.sample - (model[b.parity] + b.k * model[2])) * 1000 / sampleRate).toFloat(),
@@ -905,6 +918,10 @@ class TickDetector(
     companion object {
         /** The result counts as settled once its uncertainty is within this many seconds per week. */
         const val SYNCED_SEC_PER_WEEK = 10.0
+        /** Span of the timing trace, in seconds; longer sessions show only their latest part. */
+        const val TRACE_SECONDS = 600f
+        /** Beats up to which every new beat triggers a refit; beyond it refits are spaced out. */
+        private const val FULL_REFIT_BEATS = 2000
         /** Share of periods in which each beat must be heard before the rhythm counts as found. */
         private const val MIN_LOCK_COVERAGE = 0.6
         /**

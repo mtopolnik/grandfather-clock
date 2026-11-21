@@ -117,7 +117,10 @@ class AudioCapture(
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
 
             val minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL, ENCODING)
-            val bufferSize = maxOf(minBuf, SAMPLE_RATE / 5 * 2) // ~200ms worth of samples
+            // Audio waits in this buffer while the thread is busy (a refit late in a
+            // session of hours can take a few hundred ms); if it overflowed,
+            // samples would be lost and every later timestamp would shift.
+            val bufferSize = maxOf(minBuf, SAMPLE_RATE * 2 * 4) // 4 s of 16-bit mono
             val rec = AudioRecord(
                 MediaRecorder.AudioSource.MIC,
                 SAMPLE_RATE,
