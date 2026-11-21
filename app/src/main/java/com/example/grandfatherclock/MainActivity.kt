@@ -2,6 +2,7 @@ package com.example.grandfatherclock
 
 import android.Manifest
 import android.content.Intent
+import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.os.Bundle
 import android.provider.Settings
@@ -17,6 +18,7 @@ import androidx.core.content.ContextCompat
 import com.example.grandfatherclock.ui.ClockTunerScreen
 import com.example.grandfatherclock.ui.SessionHistoryScreen
 import com.example.grandfatherclock.ui.theme.GrandfatherClockTheme
+import java.io.File
 
 class MainActivity : ComponentActivity() {
 
@@ -40,6 +42,14 @@ class MainActivity : ComponentActivity() {
         ) == PackageManager.PERMISSION_GRANTED
 
         viewModel.wavOutputDir = getExternalFilesDir(null)
+
+        // Debug builds can replay a recording through the app instead of the mic:
+        // adb shell am start -n com.example.grandfatherclock/.MainActivity \
+        //     --es replay_wav <path on device> --ef replay_speed 4
+        if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+            intent.getStringExtra("replay_wav")?.let { viewModel.replayWav = File(it) }
+            viewModel.replaySpeed = intent.getFloatExtra("replay_speed", 1f).toDouble()
+        }
 
         setContent {
             GrandfatherClockTheme {

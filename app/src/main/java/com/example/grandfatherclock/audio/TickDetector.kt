@@ -7,124 +7,158 @@ import java.nio.ByteOrder
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
-import kotlin.math.sin
+import kotlin.math.ln
 import kotlin.math.roundToInt
+import kotlin.math.sin
 import kotlin.math.sqrt
 
 /**
  * Detects tick/tock beats from PCM audio and measures the pendulum period.
  *
- * Processes audio one 5 ms frame at a time:
- * 1. Compute each frame's high-frequency energy (>= 2 kHz via FFT) and
- *    store it in a 40-frame (200 ms) ring buffer.
- * 2. After every new frame, examine the ring buffer for an isolated
- *    energy spike (beat). This gives ~5-10 ms detection latency.
+ * 1. Band-pass 2–10 kHz, where ticks stand far above room noise, and compute the
+ *    RMS envelope in ~1 ms hops.
+ * 2. Acquire: once a few seconds are buffered, autocorrelate the onset strength
+ *    to get a candidate period, then fold the onsets at half, equal and double
+ *    that candidate. The full period is the shortest candidate whose fold shows
+ *    exactly two beats (tick and tock) roughly half a period apart. The fold
+ *    also gives each beat type's phase.
+ * 3. Track: visit predicted beat slots in time order and take the strongest
+ *    onset in a window around each prediction. A slot with nothing loud enough
+ *    is a missed beat, and sounds outside the windows are ignored. Beat number
+ *    and tick/tock identity come from the slot.
+ * 4. Estimate: fit t = a[type] + P·k by robust least squares, with separate
+ *    offsets for the two beat types and a shared period P.
+ * 5. Uncertainty: the beats wander around the line in a correlated way (the
+ *    escape wheel's per-tooth pattern, slow drift over minutes), so the formal
+ *    least-squares error is combined with a slow-wander term estimated from the
+ *    smoothed residuals.
  *
- *    Period estimation from detected beats:
- *    a. Histogram of consecutive beat-frame deltas finds 1 or 2 peaks
- *       (tick-to-tock and tock-to-tick intervals). The sum of the peak
- *       centres gives the full tick-to-tick period. Requires >= 6 total
- *       items in the identified peak buckets (>= 3 per peak if two peaks).
- *    b. Best-fit: models beat[i] = t0 + (i%2)*T1 + (i/2)*P and solves
- *       for P via least squares across all detected beats. Exploits the
- *       long baseline to recover sub-frame precision from accumulated
- *       drift (the true period is not an exact multiple of 5 ms).
- *
- * 3. WAV refinement: sample-level template matching on the full recording,
- *    searching +/-20 ms around the approximate period for maximum precision.
- *
- * Clock 1: 1481.56 ms
- * Clock 2: 1153.5 ms
+ * [analyzeWavFile] refines the tracked beats to sub-sample precision by template
+ * matching on the saved recording, then refits.
  */
-class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
+class TickDetector(
+    private val sampleRate: Int = AudioCapture.SAMPLE_RATE,
+    /** Clocks to recognise by beat rate and escape-wheel pattern. */
+    private val profiles: List<ClockProfile> = ClockProfile.KNOWN,
+) {
 
     var logger: SessionLogger? = null
 
-    enum class Method { NONE, HISTOGRAM, BEST_FIT, WAV_REFINED }
+    enum class Method { NONE, LIVE, WAV_REFINED }
+
+    /** One beat for the timing trace: its offset from the fitted straight line. */
+    data class TracePoint(
+        val timeSeconds: Float,
+        val residualMillis: Float,
+        val isTick: Boolean,
+        val inlier: Boolean,
+    )
+
+    /** A tracked beat. [k] counts full periods; [parity] 0 = tick, 1 = tock. */
+    data class Beat(val k: Int, val parity: Int, val sample: Double, val snr: Double)
 
     data class State(
         val periodMicros: Double = 0.0,
         val uncertaintyMicros: Double = 0.0,
         val tickCount: Int = 0,
+        /** Beats heard. */
         val beatCount: Int = 0,
         val lastBeatIsTick: Boolean = true,
-        /** True only on the frame where we detected a new beat. */
+        /** True only on the update where a new beat was detected. */
         val newBeat: Boolean = false,
         val elapsedSamples: Long = 0,
         val synced: Boolean = false,
         val method: Method = Method.NONE,
-        /** Tick-to-tock minus ideal half-period, in µs (positive = tick-tock gap is longer). */
+        /** Tick-to-tock gap minus half the period, in µs. */
         val imbalanceMicros: Double = 0.0,
         val imbalanceUncertaintyMicros: Double = 0.0,
+        /** True until the detector has found the clock's rhythm. */
+        val listening: Boolean = true,
+        /** Beat slots examined since the rhythm was found. */
+        val beatsExpected: Int = 0,
+        /** Fraction of the most recent beat slots in which a beat was heard. */
+        val recentHitRate: Double = 0.0,
+        val trace: List<TracePoint> = emptyList(),
+        /** The known clock whose escape-wheel pattern the beats confirmed, or null. */
+        val recognisedClock: ClockProfile? = null,
     )
 
-    // ---- Frame geometry ----
-    private val frameSamples = sampleRate / 200              // 5 ms = 220 @ 44 100
-    private val windowFrames = 40                            // 200 ms energy window
-    private val initialMinBeatGapFrames = 80                 // 400 ms between beats
-    private var minBeatGapFrames = initialMinBeatGapFrames
+    // ---- Envelope ----
+    private val hop = sampleRate / 1000                       // 44 samples ≈ 1 ms
+    private val ringSize = 1 shl 15                           // ~33 s of envelope
+    private val envRing = FloatArray(ringSize)
+    private var hopCount = 0
+    private var hopSumSq = 0.0
+    private var hopFill = 0
+    private var totalSamples = 0L
+    private val bandPass = arrayOf(
+        Biquad.highPass(2000.0, 0.5412, sampleRate),
+        Biquad.highPass(2000.0, 1.3066, sampleRate),
+        Biquad.lowPass(10000.0, 0.7071, sampleRate),
+    )
 
-    // ---- FFT for high-frequency energy ----
-    private val fftSize = 256                                // next power-of-2 >= frameSamples
-    private val hannWindow = DoubleArray(frameSamples) {
-        0.5 * (1 - cos(2.0 * PI * it / (frameSamples - 1)))
-    }
-    private val fftBuf = DoubleArray(fftSize * 2)            // interleaved [re, im]
-    private val hfStartBin = (2000.0 * fftSize / sampleRate).toInt() + 1  // first bin >= 2 kHz
-    private val hfBinCount = fftSize / 2 + 1 - hfStartBin
+    private fun env(j: Int): Float = envRing[j and (ringSize - 1)]
+    private fun hopsFor(seconds: Double) = (seconds * sampleRate / hop).roundToInt()
+    private fun samplesFor(seconds: Double) = seconds * sampleRate
+    private fun hopCenter(j: Double) = j * hop + hop / 2.0
 
-    // ---- Sample accumulation (one frame only) ----
-    private val frameBuffer = ShortArray(frameSamples)
-    private var samplesInFrame = 0
-    private var totalSamples: Long = 0
+    // ---- Noise floor: median envelope over the last 1.5 s ----
+    private var noiseFloor = 1.0
+    private val noiseWindowHops = hopsFor(1.5)
+    private val noiseUpdateHops = 250
 
-    // ---- Energy ring buffer ----
-    private val energyRing = DoubleArray(windowFrames)
-    private var energyHead = 0       // next write position
-    private var energyFilled = 0     // valid entries (grows to windowFrames)
+    // ---- Acquisition ----
+    private var locked = false
+    /** The previous lock attempt's result (a0, a1, P in samples), awaiting confirmation. */
+    private var lastCandidate: DoubleArray? = null
+    private var acqStartHop = 0
+    private var lastLockAttemptHop = 0
+    private val acqMinHops = hopsFor(6.0)
+    private val acqMaxHops = hopsFor(20.0)
+    private val minPeriodSeconds = 0.6
+    private val maxPeriodSeconds = 3.2
 
-    // ---- Frame counter (global) ----
-    private var energyCount = 0
+    // ---- Onset flash before the rhythm is known ----
+    private var lastFlashHop = -1_000_000
+    private var flashParity = 1
 
-    // ---- Beat detection ----
-    private var beatCount = 0
+    // ---- Tracking ----
+    private val model = DoubleArray(3)                        // a0, a1 (samples), P (samples)
+    private val nextK = IntArray(2)
+    private var windowSamples = samplesFor(0.060)
+    private val minWindowSamples = samplesFor(0.025)
+    private val maxWindowSamples = samplesFor(0.060)
+    private val acceptSnr = 3.5
+    private val onsetFraction = 0.25
+    private val beats = ArrayList<Beat>()
+    private var slotsExamined = 0
+    private val recentOutcomes = BooleanArray(20)
+    private var recentCount = 0
+    private var lastBeatParity = 0
     private var tickCount = 0
-    private var lastBeatIsTick = true
-    private var lastBeatFrame = -100
+    private var consecutiveMisses = 0
+    private val recentResiduals = Array(2) { DoubleArray(4) }
+    private val recentResidualCount = IntArray(2)
 
-    // ---- Beat frame positions for period estimation ----
-    private val beatFrames = mutableListOf<Int>()
-    private val beatSeqIndices = mutableListOf<Int>()  // sequence index per beat (accounts for missed beats)
+    /** All tracked beats, in time order. */
+    val detectedBeats: List<Beat> get() = beats
 
-    /** Frame indices of all detected beats (each frame = [frameSamples] audio samples). */
-    val detectedBeatFrames: List<Int> get() = beatFrames
-
-    /** Sequence index for each detected beat. Even = tick, odd = tock. Gaps indicate missed beats. */
-    val detectedBeatSequenceIndices: List<Int> get() = beatSeqIndices
-
-    /** Sub-sample-precise positions from WAV refinement, keyed by beat index. */
+    /** Sub-sample positions from [analyzeWavFile], keyed by index into [detectedBeats]. */
     var refinedBeatSamples: Map<Int, Double> = emptyMap()
         private set
 
-    // ---- Period estimation ----
+    // ---- Published estimate ----
+    private var fit: Fit? = null
     private var periodMicros = 0.0
     private var uncertaintyMicros = 0.0
-    private var method = Method.NONE
+    private var imbalanceMicros = 0.0
+    private var imbalanceUncertaintyMicros = 0.0
+    private var trace: List<TracePoint> = emptyList()
+    private var recognisedClock: ClockProfile? = null
+    /** The recognised clock's tooth count has been confirmed by this session's beats. */
+    private var toothConfirmed = false
     private var synced = false
-
-    /** Current best period estimate in microseconds. */
-    val currentPeriodMicros: Double get() = periodMicros
-    /** Current period uncertainty in microseconds. */
-    val currentUncertaintyMicros: Double get() = uncertaintyMicros
-    /** Tick-to-tock minus ideal half-period, in µs. */
-    var currentImbalanceMicros: Double = 0.0
-        private set
-    var currentImbalanceUncertaintyMicros: Double = 0.0
-        private set
-
-    private var estimateCounter = 0
-    private val estimateInterval = 168  // ~once per second (168 x 5 ms = 840 ms)
-    private val stateInterval = 28      // periodic State for UI (~140 ms)
+    private val stateIntervalHops = 140
 
     // ================================================================
     //  Public API
@@ -133,899 +167,842 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
     fun process(buffer: ShortArray, count: Int): State? = process(buffer, 0, count)
 
     fun process(buffer: ShortArray, bufferOffset: Int, count: Int): State? {
-        var pos = bufferOffset
-        val end = bufferOffset + count
         var result: State? = null
         var beatInBuffer = false
-
-        while (pos < end) {
-            val toCopy = minOf(frameSamples - samplesInFrame, end - pos)
-            System.arraycopy(buffer, pos, frameBuffer, samplesInFrame, toCopy)
-            samplesInFrame += toCopy
-            pos += toCopy
-            totalSamples += toCopy
-
-            if (samplesInFrame >= frameSamples) {
-                val s = processFrame()
+        for (i in bufferOffset until bufferOffset + count) {
+            var y = buffer[i].toDouble()
+            for (f in bandPass) y = f.process(y)
+            hopSumSq += y * y
+            totalSamples++
+            if (++hopFill == hop) {
+                envRing[hopCount and (ringSize - 1)] = sqrt(hopSumSq / hop).toFloat()
+                hopCount++
+                hopSumSq = 0.0
+                hopFill = 0
+                val s = processHop()
                 if (s != null) {
                     if (s.newBeat) beatInBuffer = true
                     result = s
                 }
-                samplesInFrame = 0
             }
         }
-        // If we detected a beat in an earlier frame but a later periodic State
-        // overwrote it, re-set newBeat so the UI doesn't miss the flash.
-        if (beatInBuffer && result != null && !result.newBeat) {
-            result = result.copy(newBeat = true)
-        }
+        // A beat in an earlier hop must still reach the UI if a later update
+        // in the same buffer replaced it.
+        if (beatInBuffer && result != null && !result.newBeat) result = result.copy(newBeat = true)
         return result
     }
 
-    fun analyzeWavFile(wavFile: File): State? {
-        if (periodMicros <= 0.0 || beatFrames.size < 8) return null
-
-        // Clip geometry: enough room for template matching, alignment, and sinc
-        val tplWidth = sampleRate / 50                     // 20 ms = 882 samples
-        val tplHalf = tplWidth / 2
-        val searchRange = frameSamples                     // ±1 frame = ±220 samples
-        val sincHalfLen = 8
-        val refineRange = 3
-        val clipHalfWidth = tplHalf + searchRange + refineRange + sincHalfLen  // 672
-
-        val totalFileSamples = ((wavFile.length() - 44) / 2).toInt()
-        if (totalFileSamples < sampleRate * 3) return null
-
-        // Read only small clips around each beat instead of the whole file
-        val diffClips = readWav(wavFile, beatFrames, clipHalfWidth, diff = true) ?: return null
-
-        val approxPeriodSamples = periodMicros / 1_000_000.0 * sampleRate
-        val approxHalfPeriod = approxPeriodSamples / 2.0
-
-        // Separate beats into two groups (tick-type / tock-type) using pair
-        // formation: consecutive beats with a valid half-period gap.
-        val halfMin = approxHalfPeriod * 0.85
-        val halfMax = approxHalfPeriod * 1.15
-        val groupA = mutableListOf<Int>()     // sample positions (for period math)
-        val groupB = mutableListOf<Int>()
-        val groupAClip = mutableListOf<Int>() // indices into clips array (for data access)
-        val groupBClip = mutableListOf<Int>()
-        var idx = 0
-        while (idx < beatFrames.size - 1) {
-            val posA = beatFrames[idx] * frameSamples
-            val posB = beatFrames[idx + 1] * frameSamples
-            val gap = posB - posA
-            if (gap >= halfMin && gap <= halfMax
-                && posA >= clipHalfWidth && posB + clipHalfWidth <= totalFileSamples) {
-                groupA.add(posA)
-                groupB.add(posB)
-                groupAClip.add(idx)
-                groupBClip.add(idx + 1)
-                idx += 2
-            } else {
-                idx += 1
-            }
-        }
-
-        if (groupA.size < 4 || groupB.size < 4) {
-            logger?.log("WAV_ANALYSIS", "Too few paired beats: A=${groupA.size} B=${groupB.size}")
-            return null
-        }
-        logger?.log("WAV_ANALYSIS",
-            "totalSamples=%d paired_beats: A=%d B=%d".format(totalFileSamples, groupA.size, groupB.size))
-
-        // --- Phase 2: Build templates with normalized correlation ---
-        // Align each clip to the running template using normalized cross-
-        // correlation (immune to amplitude differences), then average.
-        // Two iterations: first builds an initial template, second rebuilds
-        // from scratch using the improved template for alignment.
-
-        fun normalizedCorrelation(tpl: DoubleArray, clip: ShortArray, off: Int): Double {
-            var dot = 0.0
-            var energy = 1e-12
-            for (j in 0 until tplWidth) {
-                val p = clipHalfWidth - tplHalf + off + j
-                val s = if (p in clip.indices) clip[p].toDouble() else 0.0
-                dot += tpl[j] * s
-                energy += s * s
-            }
-            return dot / sqrt(energy)
-        }
-
-        fun alignBeatNorm(clip: ShortArray, tpl: DoubleArray): Int {
-            var bestOff = 0
-            var bestScore = Double.NEGATIVE_INFINITY
-            for (off in -searchRange..searchRange) {
-                val score = normalizedCorrelation(tpl, clip, off)
-                if (score > bestScore) { bestScore = score; bestOff = off }
-            }
-            return bestOff
-        }
-
-        fun buildTemplate(groupClipIdx: List<Int>, alignWith: DoubleArray?): DoubleArray {
-            val offsets = IntArray(groupClipIdx.size)
-            if (alignWith != null) {
-                // Align each clip to the provided template
-                for (k in groupClipIdx.indices) {
-                    offsets[k] = alignBeatNorm(diffClips[groupClipIdx[k]], alignWith)
-                }
-            }
-            // Average all clips (energy-normalized) to build template
-            val tpl = DoubleArray(tplWidth)
-            for (k in groupClipIdx.indices) {
-                val clip = diffClips[groupClipIdx[k]]
-                val off = offsets[k]
-                var energy = 0.0
-                val window = DoubleArray(tplWidth)
-                for (j in 0 until tplWidth) {
-                    val p = clipHalfWidth - tplHalf + off + j
-                    val s = if (p in clip.indices) clip[p].toDouble() else 0.0
-                    window[j] = s
-                    energy += s * s
-                }
-                val scale = if (energy > 1e-12) 1.0 / sqrt(energy) else 0.0
-                for (j in 0 until tplWidth) {
-                    tpl[j] += window[j] * scale
-                }
-            }
-            // Normalize the final template
-            var tplEnergy = 0.0
-            for (j in 0 until tplWidth) tplEnergy += tpl[j] * tpl[j]
-            if (tplEnergy > 1e-12) {
-                val scale = 1.0 / sqrt(tplEnergy)
-                for (j in 0 until tplWidth) tpl[j] *= scale
-            }
-            return tpl
-        }
-
-        // Iteration 1: build initial template by aligning to clip[0]
-        fun seedTemplate(groupClipIdx: List<Int>): DoubleArray {
-            val clip0 = diffClips[groupClipIdx[0]]
-            val seed = DoubleArray(tplWidth)
-            for (j in 0 until tplWidth) {
-                val p = clipHalfWidth - tplHalf + j
-                if (p in clip0.indices) seed[j] = clip0[p].toDouble()
-            }
-            return seed
-        }
-
-        var templateA = buildTemplate(groupAClip, seedTemplate(groupAClip))
-        var templateB = buildTemplate(groupBClip, seedTemplate(groupBClip))
-        // Iteration 2: rebuild using the improved templates for alignment
-        templateA = buildTemplate(groupAClip, templateA)
-        templateB = buildTemplate(groupBClip, templateB)
-
-        // --- Phase 3: Final-pass alignment with sub-sample precision ---
-        // Normalized correlation for coarse offset, then parabolic
-        // interpolation for fractional-sample refinement.
-
-        fun alignBeatPrecise(clipIdx: Int, tpl: DoubleArray): Double {
-            val clip = diffClips[clipIdx]
-            val bestOff = alignBeatNorm(clip, tpl)
-            // Parabolic interpolation around the best integer offset
-            val left = normalizedCorrelation(tpl, clip, bestOff - 1)
-            val center = normalizedCorrelation(tpl, clip, bestOff)
-            val right = normalizedCorrelation(tpl, clip, bestOff + 1)
-            val denom = left - 2.0 * center + right
-            val frac = if (abs(denom) > 1e-10) (0.5 * (left - right) / denom).coerceIn(-0.5, 0.5) else 0.0
-            return bestOff + frac
-        }
-
-        val alignOffsA = DoubleArray(groupA.size) { alignBeatPrecise(groupAClip[it], templateA) }
-        val alignOffsB = DoubleArray(groupB.size) { alignBeatPrecise(groupBClip[it], templateB) }
-        val preciseA = DoubleArray(groupA.size) { groupA[it] + alignOffsA[it] }
-        val preciseB = DoubleArray(groupB.size) { groupB[it] + alignOffsB[it] }
-
-        // Expose refined positions keyed by beat index
-        val refined = mutableMapOf<Int, Double>()
-        for (k in groupAClip.indices) refined[groupAClip[k]] = preciseA[k]
-        for (k in groupBClip.indices) refined[groupBClip[k]] = preciseB[k]
-        refinedBeatSamples = refined
-
-        // --- Phase 4: Separate tick/tock regression with outlier rejection ---
-        // Fit A (tick) and B (tock) positions independently on a full-period
-        // grid, each with its own intercept. This avoids the tick-tock
-        // asymmetry inflating the residuals. Combine the two slope estimates
-        // weighted by inverse variance. Outlier rejection via MAD.
-        val m = minOf(preciseA.size, preciseB.size)
-        if (m < 4) return null
-
-        // Assign period-grid indices (full-period spacing).
-        // For group X: index[k] = round((X[k] - X[0]) / approxPeriod)
-        fun assignIndices(positions: DoubleArray): IntArray {
-            val idx = IntArray(positions.size)
-            for (j in 1 until positions.size) {
-                idx[j] = ((positions[j] - positions[0]) / approxPeriodSamples).roundToInt()
-            }
-            return idx
-        }
-
-        // Linear regression: position[j] = t0 + index[j] * period
-        // Returns (slope, slopeVariance, inlierCount) or null.
-        // Two passes: first fits all, computes MAD, removes outliers; second refits.
-        data class LineFit(val slope: Double, val slopeVar: Double, val inliers: Int, val rms: Double)
-
-        fun fitLine(positions: DoubleArray, indices: IntArray): LineFit? {
-            var pos = positions.toMutableList()
-            var idx = indices.toMutableList()
-            var slope = 0.0
-            var slopeVar = 0.0
-            var rms = 0.0
-            for (pass in 0..1) {
-                val n = pos.size
-                if (n < 3) return null
-                var sk = 0.0; var skk = 0.0; var sp = 0.0; var skp = 0.0
-                for (j in 0 until n) {
-                    val k = idx[j].toDouble()
-                    sk += k; skk += k * k; sp += pos[j]; skp += k * pos[j]
-                }
-                val det = n.toDouble() * skk - sk * sk
-                if (abs(det) < 1e-12) return null
-                slope = (n.toDouble() * skp - sk * sp) / det
-                if (slope <= 0) return null
-                val t0 = (skk * sp - sk * skp) / det
-                val residuals = DoubleArray(n) { pos[it] - (t0 + idx[it] * slope) }
-
-                if (pass == 0) {
-                    val sortedAbs = residuals.map { abs(it) }.sorted()
-                    val medAbsDev = sortedAbs[sortedAbs.size / 2]
-                    val robustScale = maxOf(1.0, 1.4826 * medAbsDev)
-                    val cutoff = 3.5 * robustScale
-                    val newPos = mutableListOf<Double>()
-                    val newIdx = mutableListOf<Int>()
-                    for (j in 0 until n) {
-                        if (abs(residuals[j]) <= cutoff) {
-                            newPos.add(pos[j])
-                            newIdx.add(idx[j])
-                        }
-                    }
-                    if (newPos.size < n) {
-                        logger?.log("WAV_OUTLIER",
-                            "removed %d/%d beats (cutoff=%.1f samples)"
-                                .format(n - newPos.size, n, cutoff))
-                    }
-                    pos = newPos
-                    idx = newIdx
-                } else {
-                    var sumResidualSq = 0.0
-                    for (r in residuals) sumResidualSq += r * r
-                    val sigma2 = if (n > 2) sumResidualSq / (n - 2) else 0.0
-                    slopeVar = if (abs(det) > 1e-20 && n > 2) n.toDouble() / det * sigma2 else 0.0
-                    rms = if (n > 2) sqrt(sigma2) else 0.0
-                }
-            }
-            return LineFit(slope, slopeVar, pos.size, rms)
-        }
-
-        val idxA = assignIndices(preciseA)
-        val idxB = assignIndices(preciseB)
-        val fitA = fitLine(preciseA, idxA)
-        val fitB = fitLine(preciseB, idxB)
-
-        if (fitA == null && fitB == null) return null
-
-        // Combine slopes weighted by inverse variance
-        val period: Double
-        val periodVar: Double
-        val rmsResidual: Double
-        val inlierCount: Int
-        if (fitA != null && fitB != null) {
-            if (fitA.slopeVar > 0 && fitB.slopeVar > 0) {
-                val wA = 1.0 / fitA.slopeVar
-                val wB = 1.0 / fitB.slopeVar
-                period = (fitA.slope * wA + fitB.slope * wB) / (wA + wB)
-                periodVar = 1.0 / (wA + wB)
-            } else {
-                period = (fitA.slope + fitB.slope) / 2.0
-                periodVar = 0.0
-            }
-            rmsResidual = (fitA.rms + fitB.rms) / 2.0
-            inlierCount = fitA.inliers + fitB.inliers
-        } else {
-            val fit = fitA ?: fitB!!
-            period = fit.slope
-            periodVar = fit.slopeVar
-            rmsResidual = fit.rms
-            inlierCount = fit.inliers
-        }
-
-        val wavPeriod = period / sampleRate * 1_000_000.0
-        val wavUncertainty = if (periodVar > 0) sqrt(periodVar) / sampleRate * 1_000_000.0 else 0.0
-
-        logger?.log("WAV_RESULT",
-            "period=%.3f samples (%.1fµs ±%.1fµs) inliers=%d rms=%.2f"
-                .format(period, wavPeriod, wavUncertainty, inlierCount, rmsResidual))
-
-        periodMicros = wavPeriod
-        uncertaintyMicros = wavUncertainty
-        method = Method.WAV_REFINED
-        synced = true
-
-        // --- Phase 5: Imbalance (tick-to-tock asymmetry) ---
-        val tickToTockGaps = DoubleArray(m) { preciseB[it] - preciseA[it] }
-        val avgGap = tickToTockGaps.average()
-        val imbalanceSamples = avgGap - period / 2.0
-        currentImbalanceMicros = imbalanceSamples / sampleRate * 1_000_000.0
-        currentImbalanceUncertaintyMicros = if (m > 1) {
-            var sumSq = 0.0
-            for (g in tickToTockGaps) { val d = g - avgGap; sumSq += d * d }
-            val se = sqrt(sumSq / (m * (m - 1).toDouble()))
-            se / sampleRate * 1_000_000.0
-        } else 0.0
-        logger?.log("WAV_IMBALANCE",
-            "%.0f ± %.0f µs (%d pairs)"
-                .format(currentImbalanceMicros, currentImbalanceUncertaintyMicros, m))
-
-        // --- Phase 6: Idealized WAV ---
-        writeIdealizedFromWav(wavFile, preciseA, preciseB, period, totalFileSamples)
-
-        return State(
-            periodMicros = wavPeriod,
-            uncertaintyMicros = wavUncertainty,
-            tickCount = tickCount,
-            beatCount = beatCount,
-            lastBeatIsTick = lastBeatIsTick,
-            newBeat = false,
-            elapsedSamples = totalSamples,
-            synced = true,
-            method = Method.WAV_REFINED,
-            imbalanceMicros = currentImbalanceMicros,
-            imbalanceUncertaintyMicros = currentImbalanceUncertaintyMicros,
-        )
-    }
-
-    private fun writeIdealizedFromWav(
-        wavFile: File,
-        tickPositions: DoubleArray,
-        tockPositions: DoubleArray,
-        periodSamples: Double,
-        totalFileSamples: Int,
-    ) {
-        val tplWidth = sampleRate / 50              // 20ms = 882 samples
-        val tplHalf = tplWidth / 2
-        val amplitudeThreshold = 0.9 * 32767
-
-        fun buildTemplate(positions: DoubleArray): ShortArray {
-            val tpl = DoubleArray(tplWidth)
-            var count = 0
-            RandomAccessFile(wavFile, "r").use { raf ->
-                for (center in positions) {
-                    val centerInt = center.roundToInt()
-                    if (centerInt < tplHalf || centerInt + tplHalf >= totalFileSamples) continue
-                    val clipStart = centerInt - tplHalf
-                    raf.seek(44L + clipStart.toLong() * 2L)
-                    val bytes = ByteArray(tplWidth * 2)
-                    raf.readFully(bytes)
-                    val bb = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
-
-                    var energy = 0.0
-                    val window = DoubleArray(tplWidth)
-                    for (j in 0 until tplWidth) {
-                        val s = bb.short.toDouble()
-                        window[j] = s
-                        energy += s * s
-                    }
-                    if (energy <= 1e-12) continue
-                    val scale = 1.0 / sqrt(energy)
-                    for (j in 0 until tplWidth) tpl[j] += window[j] * scale
-                    count++
-                }
-            }
-            if (count < 3) return ShortArray(tplWidth)
-            val peak = tpl.maxOf { abs(it) }
-            val scale = if (peak > 0.0) amplitudeThreshold / peak else 1.0
-            return ShortArray(tplWidth) { (tpl[it] * scale).roundToInt().coerceIn(-32768, 32767).toShort() }
-        }
-
-        val tickTemplate = buildTemplate(tickPositions)
-        val tockTemplate = buildTemplate(tockPositions)
-
-        val tickToTockSamples = if (currentImbalanceMicros != 0.0) {
-            periodSamples / 2.0 + currentImbalanceMicros / 1_000_000.0 * sampleRate
-        } else periodSamples / 2.0
-        val tockToTickSamples = periodSamples - tickToTockSamples
-        val silenceAfterTick = maxOf(0, (tickToTockSamples - tplWidth).roundToInt())
-        val silenceAfterTock = maxOf(0, (tockToTickSamples - tplWidth).roundToInt())
-
-        val idealizedFile = File(wavFile.parent, "clock_idealized.wav")
-        writeIdealizedWav(idealizedFile, tickTemplate, tockTemplate,
-            silenceAfterTick, silenceAfterTock)
-
-        logger?.log("IDEALIZED_WAV",
-            "tick=%d tock=%d silenceAfterTick=%d silenceAfterTock=%d"
-                .format(tickTemplate.size, tockTemplate.size, silenceAfterTick, silenceAfterTock))
-    }
-
     fun reset() {
-        samplesInFrame = 0
-        totalSamples = 0
-        energyCount = 0
-        energyHead = 0
-        energyFilled = 0
-        beatCount = 0
+        hopCount = 0; hopSumSq = 0.0; hopFill = 0; totalSamples = 0
+        bandPass.forEach { it.reset() }
+        noiseFloor = 1.0
+        lastFlashHop = -1_000_000; flashParity = 1
         tickCount = 0
-        lastBeatIsTick = true
-        lastBeatFrame = -100
-        beatFrames.clear()
-        beatSeqIndices.clear()
+        restartAcquisition()
         refinedBeatSamples = emptyMap()
-        minBeatGapFrames = initialMinBeatGapFrames
-        periodMicros = 0.0
-        uncertaintyMicros = 0.0
-        method = Method.NONE
-        synced = false
-        currentImbalanceMicros = 0.0
-        currentImbalanceUncertaintyMicros = 0.0
-        estimateCounter = 0
     }
 
     // ================================================================
-    //  Per-frame processing
+    //  Per-hop processing
     // ================================================================
 
-    private fun processFrame(): State? {
-        // Compute HF energy for this single 5 ms frame
-        val energy = computeHfEnergy()
+    private fun processHop(): State? {
+        if (hopCount % noiseUpdateHops == 0 || hopCount == 50) updateNoiseFloor()
 
-        // Store in ring buffer
-        energyRing[energyHead] = energy
-        energyHead = (energyHead + 1) % windowFrames
-        if (energyFilled < windowFrames) energyFilled++
-        energyCount++
-
-        // Beat detection once ring buffer is full
         var newBeat = false
-        if (energyFilled >= windowFrames) {
-            newBeat = detectSpike()
+        if (!locked) {
+            newBeat = detectFlash()
+            if (hopCount - acqStartHop >= acqMinHops && hopCount - lastLockAttemptHop >= hopsFor(1.0)) {
+                lastLockAttemptHop = hopCount
+                tryLock()
+            }
         }
-
-        // Period estimation (~once per second)
-        var periodUpdated = false
-        estimateCounter++
-        if (estimateCounter >= estimateInterval && beatFrames.size >= 4) {
-            estimateCounter = 0
-            estimatePeriod()
-            periodUpdated = true
+        var updated = false
+        while (locked && nextSlotReady()) {
+            if (processNextSlot()) { newBeat = true; updated = true }
+            if (!locked) break
         }
-
-        // Return State on beat, period update, or periodically for elapsed time
-        if (newBeat || periodUpdated || energyCount % stateInterval == 0) {
-            return State(
-                periodMicros = periodMicros,
-                uncertaintyMicros = uncertaintyMicros,
-                tickCount = tickCount,
-                beatCount = beatCount,
-                lastBeatIsTick = lastBeatIsTick,
-                newBeat = newBeat,
-                elapsedSamples = totalSamples,
-                synced = synced,
-                method = method,
-            )
-        }
+        if (newBeat || updated || hopCount % stateIntervalHops == 0) return currentState(newBeat)
         return null
     }
 
-    /**
-     * Compute the RMS energy of frequency bins >= 2 kHz for the current frame
-     * in [frameBuffer].
-     */
-    private fun computeHfEnergy(): Double {
-        // Zero the buffer, then copy windowed samples into real part
-        for (i in fftBuf.indices) fftBuf[i] = 0.0
-        for (i in 0 until frameSamples) {
-            fftBuf[2 * i] = frameBuffer[i].toDouble() * hannWindow[i]
-        }
-        fft(fftBuf, fftSize)
+    private fun currentState(newBeat: Boolean) = State(
+        periodMicros = periodMicros,
+        uncertaintyMicros = uncertaintyMicros,
+        tickCount = tickCount,
+        beatCount = beats.size,
+        lastBeatIsTick = lastBeatParity == 0,
+        newBeat = newBeat,
+        elapsedSamples = totalSamples,
+        synced = synced,
+        method = if (periodMicros > 0) Method.LIVE else Method.NONE,
+        imbalanceMicros = imbalanceMicros,
+        imbalanceUncertaintyMicros = imbalanceUncertaintyMicros,
+        listening = !locked,
+        beatsExpected = slotsExamined,
+        recentHitRate = recentHitRate(),
+        trace = trace,
+        recognisedClock = recognisedClock,
+    )
 
-        var sum = 0.0
-        for (k in hfStartBin..fftSize / 2) {
-            val re = fftBuf[2 * k]
-            val im = fftBuf[2 * k + 1]
-            sum += re * re + im * im
+    private fun updateNoiseFloor() {
+        val n = minOf(noiseWindowHops, hopCount, ringSize)
+        if (n < 20) return
+        val v = FloatArray(n) { env(hopCount - n + it) }
+        v.sort()
+        noiseFloor = maxOf(1.0, v[n / 2].toDouble())
+    }
+
+    /** Flashes on loud onsets while the rhythm is still unknown, so the user sees the app hearing something. */
+    private fun detectFlash(): Boolean {
+        val j = hopCount - 2
+        // The noise floor needs a moment of audio before it means anything.
+        if (hopCount < 300) return false
+        val e = env(j)
+        if (e > 6 * noiseFloor && e >= env(j - 1) && e > env(j + 1) && j - lastFlashHop >= hopsFor(0.25)) {
+            lastFlashHop = j
+            flashParity = 1 - flashParity
+            lastBeatParity = flashParity
+            return true
         }
-        return sqrt(sum / hfBinCount)
+        return false
     }
 
     // ================================================================
-    //  Spike (beat) detection
+    //  Acquisition: period and phases
     // ================================================================
 
-    private fun detectSpike(): Boolean {
-        // Linearize ring buffer: oldest at index 0, newest at windowFrames-1
-        val energy = DoubleArray(windowFrames) { i ->
-            energyRing[(energyHead + i) % windowFrames]
-        }
-
-        val sorted = energy.copyOf().also { it.sort() }
-        val median = sorted[windowFrames / 2]
-        val peak = energy.max()
-
-        // HF energy gives 15-30x tick/noise ratio; 3x is a safe pre-filter
-        if (peak < median * 3.0 || peak < 1000.0) {
-            if (peak > median * 1.5 && peak > 500.0 && energy[windowFrames - 1] == peak) {
-                val audioTime = totalSamples.toDouble() / sampleRate
-                logger?.log("SPIKE_BELOW_THR",
-                    "t=%.3fs peak=%.0f median=%.0f ratio=%.1f (need 3.0x)"
-                        .format(audioTime, peak, median, peak / maxOf(median, 1.0)))
-            }
-            return false
-        }
-
-        var peakFrame = 0
-        for (f in 1 until windowFrames) {
-            if (energy[f] > energy[peakFrame]) peakFrame = f
-        }
-
-        val threshold = median + (peak - median) * 0.8
-
-        // Expand outward from peak to find the contiguous streak of loud frames
-        var spikeStart = peakFrame
-        var spikeEnd = peakFrame
-        while (spikeStart > 0 && energy[spikeStart - 1] > threshold) spikeStart--
-        while (spikeEnd < windowFrames - 1 && energy[spikeEnd + 1] > threshold) spikeEnd++
-
-        val streakLen = spikeEnd - spikeStart + 1
-        val globalFrame = energyCount - windowFrames + peakFrame
-        val audioTime = totalSamples.toDouble() / sampleRate
-
-        if (streakLen > 5) {
-            if (energy[windowFrames - 1] == peak) {
-                logger?.log("SPIKE_TOO_WIDE",
-                    "t=%.3fs peak=%.0f streak=%d frames (%dms) global_frame=%d"
-                        .format(audioTime, peak, streakLen, streakLen * 5, globalFrame))
-            }
-            return false
-        }
-
-        // Require quiet frames on both sides of the streak
-        if (spikeStart < 1 || spikeEnd > windowFrames - 2) {
-            return false
-        }
-        if (energy[spikeStart - 1] >= threshold || energy[spikeEnd + 1] >= threshold) {
-            return false
-        }
-
-        if (globalFrame - lastBeatFrame < minBeatGapFrames) {
-            return false
-        }
-
-        // Detect missed beat: if we have a stable period and the gap since the
-        // last beat is ~2x the expected half-period, a beat was missed. Increment
-        // beatCount by 2 so tick/tock assignment stays correct.
-        val prevBeatFrame = lastBeatFrame
-        val gap = globalFrame - prevBeatFrame
-        var missed = false
-        if (prevBeatFrame >= 0 && periodMicros > 0 && beatCount >= 10) {
-            val halfPeriodFrames = periodMicros / 1_000_000.0 * sampleRate / frameSamples / 2.0
-            // Gap is ~2x half-period (i.e., ~1 full period) → missed one beat
-            if (gap > halfPeriodFrames * 1.6 && gap < halfPeriodFrames * 2.5) {
-                beatCount++  // extra increment for the missed beat
-                if ((beatCount % 2 == 1)) tickCount++ // missed beat was a tick
-                missed = true
-                logger?.log("MISSED_BEAT",
-                    "gap=%d frames (%.0fms) expected_half=%.0f frames, incrementing beatCount"
-                        .format(gap, gap * frameSamples * 1000.0 / sampleRate, halfPeriodFrames))
-            }
-        }
-
-        beatCount++
-        lastBeatIsTick = (beatCount % 2 == 1)
-        if (lastBeatIsTick) tickCount++
-        lastBeatFrame = globalFrame
-
-        beatFrames.add(globalFrame)
-        beatSeqIndices.add(beatCount - 1)  // 0-based: even=tick, odd=tock
-
-        val beatType = if (lastBeatIsTick) "TICK" else "TOCK"
-        val gapFromPrev = if (prevBeatFrame >= 0) {
-            val gapMs = (globalFrame - prevBeatFrame) * frameSamples * 1000.0 / sampleRate
-            "gap=%.0fms".format(gapMs)
-        } else "gap=N/A"
-        logger?.log("BEAT",
-            "#%d %s t=%.3fs peak=%.0f median=%.0f ratio=%.1f streak=%d %s global_frame=%d%s"
-                .format(beatCount, beatType, audioTime, peak, median,
-                    peak / maxOf(median, 1.0), streakLen, gapFromPrev, globalFrame,
-                    if (missed) " (after missed beat)" else ""))
-
-        return true
-    }
-
-    // ================================================================
-    //  Period estimation: histogram of deltas + least-squares best fit
-    // ================================================================
-
-    private fun estimatePeriod() {
-        val n = beatFrames.size
-        if (n < 4) return
-
-        // Step 1: consecutive beat-to-beat deltas (in 5ms frames)
-        val deltas = IntArray(n - 1) { beatFrames[it + 1] - beatFrames[it] }
-
-        // Step 2: histogram — count occurrences of each delta value
-        val histogram = mutableMapOf<Int, Int>()
-        for (d in deltas) {
-            histogram[d] = (histogram[d] ?: 0) + 1
-        }
-
-        // Group adjacent delta values (within 2 frames = 10ms) into clusters
-        val sortedKeys = histogram.keys.sorted()
-        if (sortedKeys.isEmpty()) return
-
-        data class Cluster(val keys: MutableList<Int> = mutableListOf(), var count: Int = 0)
-        val clusters = mutableListOf<Cluster>()
-        var cur = Cluster()
-        for (key in sortedKeys) {
-            if (cur.keys.isNotEmpty() && key - cur.keys.last() > 2) {
-                clusters.add(cur)
-                cur = Cluster()
-            }
-            cur.keys.add(key)
-            cur.count += histogram[key]!!
-        }
-        clusters.add(cur)
-        clusters.sortByDescending { it.count }
-
-        // Weighted centre of a cluster
-        fun clusterCenter(c: Cluster): Double {
-            var sum = 0.0; var cnt = 0
-            for (k in c.keys) {
-                val w = histogram[k]!!
-                sum += k.toDouble() * w
-                cnt += w
-            }
-            return sum / cnt
-        }
-
-        // Determine if we have 1 or 2 peaks.
-        // Reject any second peak with fewer than 80% of the top peak's count —
-        // genuine half-period peaks have roughly equal counts, while artifacts
-        // (e.g. missed-beat gaps) are far rarer.
-        val c1 = clusterCenter(clusters[0])
-        val c2 = if (clusters.size >= 2) clusterCenter(clusters[1]) else 0.0
-        val twoPeaks = clusters.size >= 2
-            && clusters[1].count >= clusters[0].count * 0.8
-        val histPeriodFrames: Double
-        val halfPeriodCenters: List<Double>
-
-        if (twoPeaks) {
-            // Two peaks visible — need >= 3 items in each before reporting
-            if (clusters[0].count < 3 || clusters[1].count < 3) return
-            histPeriodFrames = c1 + c2
-            halfPeriodCenters = listOf(c1, c2)
-
-            logger?.log("HISTOGRAM",
-                "deltas=%d 2-peak period=%.1f frames (%.0fµs) p1=%.1f(%d) p2=%.1f(%d)"
-                    .format(deltas.size, histPeriodFrames,
-                        histPeriodFrames * frameSamples.toDouble() / sampleRate * 1_000_000.0,
-                        c1, clusters[0].count, c2, clusters[1].count))
-        } else {
-            // One peak — need >= 6 items
-            if (clusters[0].count < 6) return
-            histPeriodFrames = c1 * 2.0
-            halfPeriodCenters = listOf(c1)
-
-            logger?.log("HISTOGRAM",
-                "deltas=%d 1-peak period=%.1f frames (%.0fµs) center=%.1f(%d)"
-                    .format(deltas.size, histPeriodFrames,
-                        histPeriodFrames * frameSamples.toDouble() / sampleRate * 1_000_000.0,
-                        c1, clusters[0].count))
-        }
-
-        val framesToMicros = frameSamples.toDouble() / sampleRate * 1_000_000.0
-        periodMicros = histPeriodFrames * framesToMicros
-        method = Method.HISTOGRAM
-        uncertaintyMicros = 0.0
+    private fun restartAcquisition() {
+        locked = false
+        lastCandidate = null
+        acqStartHop = hopCount
+        lastLockAttemptHop = hopCount
+        beats.clear()
+        slotsExamined = 0
+        recentCount = 0
+        consecutiveMisses = 0
+        recentResidualCount.fill(0)
+        windowSamples = maxWindowSamples
+        fit = null
+        periodMicros = 0.0; uncertaintyMicros = 0.0
+        imbalanceMicros = 0.0; imbalanceUncertaintyMicros = 0.0
+        trace = emptyList()
+        recognisedClock = null
+        toothConfirmed = false
         synced = false
+    }
 
-        // Adapt dead zone: prevent false beats from echoes within the half-period
-        val adaptiveGap = (halfPeriodCenters.min() - 10).toInt()
-        if (adaptiveGap > minBeatGapFrames) {
-            minBeatGapFrames = adaptiveGap
-            logger?.log("DEAD_ZONE_ADAPT", "minBeatGapFrames=%d (%dms)"
-                .format(minBeatGapFrames, minBeatGapFrames * frameSamples * 1000 / sampleRate))
+    private fun tryLock() {
+        val end = hopCount
+        val start = maxOf(acqStartHop, end - acqMaxHops, end - ringSize + 1)
+        val n = end - start
+        // Onset strength: rises in log envelope, lightly smoothed.
+        val raw = DoubleArray(n)
+        var prev = ln(env(start) + 1.0)
+        for (i in 1 until n) {
+            val cur = ln(env(start + i) + 1.0)
+            raw[i] = maxOf(0.0, cur - prev)
+            prev = cur
+        }
+        val ons = DoubleArray(n) { i ->
+            raw[i] + (if (i > 0) raw[i - 1] else 0.0) + (if (i < n - 1) raw[i + 1] else 0.0)
         }
 
-        // Step 3: pair-based best-fit for sub-frame precision
-        if (n >= 8) {
-            val halfMin = halfPeriodCenters.min() - 10
-            val halfMax = halfPeriodCenters.max() + 10
-            bestFitPeriod(histPeriodFrames, halfMin, halfMax)
+        val ac = autocorrelation(ons)
+        val lo = hopsFor(0.45)
+        val hi = minOf(hopsFor(maxPeriodSeconds), n / 3)
+        if (hi <= lo + 2) return
+        var best = lo
+        for (l in lo..hi) if (ac[l] > ac[best]) best = l
+        val confidence = ac[best] / ac[0]
+        val l = best + parabolicOffset(ac[best - 1], ac[best], ac[best + 1])
+
+        for (cand in doubleArrayOf(l / 2, l, 2 * l)) {
+            if (cand < hopsFor(minPeriodSeconds) || cand > hopsFor(maxPeriodSeconds) || n < 4 * cand) continue
+            val (first, second) = foldPeaks(ons, cand, start) ?: continue
+            val p = cand * hop
+            val a0 = hopCenter(start + first)
+            val a1 = hopCenter(start + second)
+            // Lock only when two attempts a second apart agree, so a single
+            // coincidence in the buffer can't set the rhythm.
+            val prev = lastCandidate
+            lastCandidate = doubleArrayOf(a0, a1, p)
+            val agrees = prev != null && abs(prev[2] - p) < 0.005 * p &&
+                abs(phaseDiff(prev[0], a0, p)) < samplesFor(0.015) &&
+                abs(phaseDiff(prev[1], a1, p)) < samplesFor(0.015)
+            logger?.log(if (agrees) "LOCK" else "LOCK_CANDIDATE",
+                "period=%.1fms phases=%.1f/%.1fms after %.1fs (ac peak %.1fms conf=%.2f)"
+                    .format(p / sampleRate * 1000, first * hop * 1000.0 / sampleRate,
+                        second * hop * 1000.0 / sampleRate, n * hop.toDouble() / sampleRate,
+                        l * hop * 1000.0 / sampleRate, confidence))
+            if (!agrees) return
+            model[0] = a0; model[1] = a1; model[2] = p
+            nextK[0] = 0; nextK[1] = 0
+            locked = true
+            return
         }
+        lastCandidate = null
+        logger?.log("LOCK_WAIT", "no tick/tock pair in the fold yet (ac peak %.1fms conf=%.2f, %.1fs buffered)"
+            .format(l * hop * 1000.0 / sampleRate, confidence, n * hop.toDouble() / sampleRate))
+    }
+
+    /** Difference between two phases modulo [period], in (-period/2, period/2]. */
+    private fun phaseDiff(a: Double, b: Double, period: Double): Double {
+        var d = (b - a) % period
+        if (d > period / 2) d -= period
+        if (d <= -period / 2) d += period
+        return d
     }
 
     /**
-     * Pair-based least-squares fit for the full tick-to-tick period.
-     *
-     * Groups consecutive detected beats into pairs where the gap matches
-     * a known half-period (from the histogram). Uses the **midpoint** of
-     * each pair as its position. Midpoints of tick-tock and tock-tick
-     * pairs both lie on a uniform half-period grid, so if a missed beat
-     * flips the tick/tock labeling, the midpoints still align — the fit
-     * is immune to beat-type flips.
-     *
-     * Assigns indices on the half-period grid, fits
-     *   midpoint[j] = t0 + index[j] * halfP
-     * via linear regression, and reports the full period as 2 * halfP.
+     * Folds [ons] at [period] (in hops) and returns the two beats' phases (in hops,
+     * earlier first) when the fold shows exactly two clear peaks between a quarter
+     * and three quarters of a period apart; otherwise null.
      */
-    private fun bestFitPeriod(
-        approxPeriodFrames: Double,
-        halfPeriodMin: Double,
-        halfPeriodMax: Double,
-    ) {
-        val n = beatFrames.size
+    private fun foldPeaks(ons: DoubleArray, period: Double, start: Int): Pair<Double, Double>? {
+        val nbins = (period / 2).roundToInt()                 // 2 ms bins
+        if (nbins < 8) return null
+        val h = DoubleArray(nbins)
+        for (i in ons.indices) {
+            val b = ((i % period) / period * nbins).toInt().coerceIn(0, nbins - 1)
+            h[b] += ons[i]
+        }
+        val sm = DoubleArray(nbins) { b ->
+            var s = 0.0
+            for (d in -2..2) s += h[(b + d + nbins) % nbins]
+            s / 5
+        }
+        val sorted = sm.sortedArray()
+        val med = sorted[nbins / 2]
+        val sigma = 1.4826 * sm.map { abs(it - med) }.sorted()[nbins / 2] + 1e-12
+        val max = sorted[nbins - 1]
+        // A peak counts as a beat when it stands well clear of the fold's own
+        // noise, so a quiet tock still counts next to a loud tick.
+        val threshold = med + maxOf(6 * sigma, 0.15 * (max - med))
 
-        // Step 1: form pairs — consecutive beats with a valid half-period gap.
-        // Record the midpoint of each pair.
-        val pairMidpoints = mutableListOf<Double>()
-        var i = 0
-        while (i < n - 1) {
-            val delta = beatFrames[i + 1] - beatFrames[i]
-            if (delta >= halfPeriodMin && delta <= halfPeriodMax) {
-                pairMidpoints.add((beatFrames[i] + beatFrames[i + 1]) / 2.0)
-                i += 2
-            } else {
-                i += 1
+        val maxima = (0 until nbins).filter { b ->
+            sm[b] >= sm[(b - 1 + nbins) % nbins] && sm[b] >= sm[(b + 1) % nbins]
+        }.sortedByDescending { sm[it] }
+        val minSep = 0.15 * nbins
+        val peaks = mutableListOf<Int>()
+        for (b in maxima) {
+            if (peaks.all { circularDistance(it, b, nbins) >= minSep }) peaks += b
+        }
+        val strong = peaks.filter { sm[it] > threshold }.sorted()
+        // Tick and tock sit half a period apart, give or take the clock's beat
+        // error; a clock more than 10% of a period out of beat would stop. The
+        // strongest such pair is taken, so other repeating sounds (such as a
+        // secondary click after each beat) don't count as beats.
+        val binHops = period / nbins
+        var bestPair: Pair<Int, Int>? = null
+        var bestWeaker = 0.0
+        for (i in strong.indices) for (j in i + 1 until strong.size) {
+            val sep = (strong[j] - strong[i]).toDouble() / nbins
+            if (sep < 0.40 || sep > 0.60) continue
+            val weaker = minOf(sm[strong[i]], sm[strong[j]])
+            if (weaker <= bestWeaker) continue
+            // A real beat sounds in most periods; a few loud sounds that happen
+            // to line up do not.
+            if (coverage(start, ons.size, (strong[i] + 0.5) * binHops, period) < MIN_LOCK_COVERAGE ||
+                coverage(start, ons.size, (strong[j] + 0.5) * binHops, period) < MIN_LOCK_COVERAGE) continue
+            bestWeaker = weaker
+            bestPair = strong[i] to strong[j]
+        }
+        val (b0, b1) = bestPair ?: return null
+        return Pair((b0 + 0.5) * binHops, (b1 + 0.5) * binHops)
+    }
+
+    /**
+     * Fraction of periods in the buffer that have a loud onset within ±15 ms of
+     * [phase] (in hops from [start]).
+     */
+    private fun coverage(start: Int, n: Int, phase: Double, period: Double): Double {
+        val w = hopsFor(0.015)
+        var periods = 0
+        var heard = 0
+        var m = 0
+        while (true) {
+            val c = (phase + m * period).roundToInt()
+            if (c + w >= n) break
+            if (c - w >= 0) {
+                periods++
+                var max = 0f
+                for (j in c - w..c + w) max = maxOf(max, env(start + j))
+                if (max >= 4 * noiseFloor) heard++
+            }
+            m++
+        }
+        return if (periods >= 3) heard.toDouble() / periods else 0.0
+    }
+
+    private fun circularDistance(a: Int, b: Int, n: Int): Int {
+        val d = abs(a - b)
+        return minOf(d, n - d)
+    }
+
+    private fun autocorrelation(x: DoubleArray): DoubleArray {
+        val n = x.size
+        val mean = x.average()
+        var m = 1
+        while (m < 2 * n) m = m shl 1
+        val buf = DoubleArray(2 * m)
+        for (i in 0 until n) buf[2 * i] = x[i] - mean
+        fft(buf, m)
+        for (i in 0 until m) {
+            val re = buf[2 * i]; val im = buf[2 * i + 1]
+            buf[2 * i] = re * re + im * im
+            buf[2 * i + 1] = 0.0
+        }
+        // The power spectrum is real and even, so a forward FFT gives the
+        // autocorrelation up to the factor m.
+        fft(buf, m)
+        return DoubleArray(n) { buf[2 * it] / m }
+    }
+
+    // ================================================================
+    //  Tracking
+    // ================================================================
+
+    private fun nextParity(): Int =
+        if (model[0] + nextK[0] * model[2] <= model[1] + nextK[1] * model[2]) 0 else 1
+
+    private fun predicted(parity: Int, k: Int) = model[parity] + k * model[2]
+
+    private fun nextSlotReady(): Boolean {
+        val p = nextParity()
+        return predicted(p, nextK[p]) + windowSamples + samplesFor(0.005) <= hopCount.toDouble() * hop
+    }
+
+    /** Examines the next beat slot; returns true when a beat was heard there. */
+    private fun processNextSlot(): Boolean {
+        val parity = nextParity()
+        val k = nextK[parity]
+        nextK[parity] = k + 1
+        // The window follows where this beat type has recently landed relative
+        // to the line, so excursions of the beat timing stay inside it. After a
+        // run of empty slots it opens fully to find the beats again.
+        val linePred = predicted(parity, k)
+        val pred = linePred + localOffset(parity)
+        val w = if (consecutiveMisses >= 3) maxWindowSamples else windowSamples
+        val oldest = maxOf(1, hopCount - ringSize + 32)
+        val j0 = maxOf(oldest, ((pred - w - hop / 2.0) / hop).toInt())
+        val j1 = minOf(hopCount - 1, ((pred + w - hop / 2.0) / hop).toInt() + 1)
+        if (j1 <= j0 + 2) return false
+
+        var bestJ = j0
+        var bestScore = -1.0
+        for (j in j0..j1) {
+            val rel = (hopCenter(j.toDouble()) - pred) / w
+            val score = env(j) * (1 - 0.5 * rel * rel)
+            if (score > bestScore) { bestScore = score; bestJ = j }
+        }
+        val peak = env(bestJ).toDouble()
+        val snr = peak / noiseFloor
+        slotsExamined++
+        val heard = snr >= acceptSnr
+        recordOutcome(heard)
+
+        if (heard) {
+            val thr = noiseFloor + onsetFraction * (peak - noiseFloor)
+            var i = bestJ
+            while (i > bestJ - 30 && i > oldest && env(i - 1) > thr) i--
+            val e0 = env(i - 1).toDouble(); val e1 = env(i).toDouble()
+            val frac = if (e1 > e0) ((thr - e0) / (e1 - e0)).coerceIn(0.0, 1.0) else 0.0
+            val onset = hopCenter(i - 1 + frac)
+            beats += Beat(k, parity, onset, snr)
+            if (parity == 0) tickCount++
+            lastBeatParity = parity
+            consecutiveMisses = 0
+            recentResiduals[parity][recentResidualCount[parity] % recentResiduals[parity].size] = onset - linePred
+            recentResidualCount[parity]++
+            refit()
+            logger?.log("BEAT", "k=%d %s t=%.4fs snr=%.1f err=%+.1fms window=±%.0fms".format(
+                k, if (parity == 0) "TICK" else "TOCK", onset / sampleRate, snr,
+                (onset - pred) * 1000 / sampleRate, w * 1000 / sampleRate))
+        } else {
+            consecutiveMisses++
+            logger?.log("MISS", "k=%d %s t=%.4fs best snr=%.1f".format(
+                k, if (parity == 0) "TICK" else "TOCK", pred / sampleRate, snr))
+        }
+
+        // Many silent slots soon after locking mean the rhythm was found wrongly.
+        // Later on, missed beats only lower the hit rate the user sees, because
+        // an established session is worth keeping through a noisy stretch.
+        if (beats.size < 30 && recentCount >= recentOutcomes.size && recentHitRate() < 0.4) {
+            logger?.log("RELOCK", "heard %.0f%% of the last %d beat slots"
+                .format(recentHitRate() * 100, recentOutcomes.size))
+            restartAcquisition()
+        }
+        return heard
+    }
+
+    /** Median offset of this beat type's last few beats from the line at the time they were heard. */
+    private fun localOffset(parity: Int): Double {
+        val n = minOf(recentResidualCount[parity], recentResiduals[parity].size)
+        if (n == 0) return 0.0
+        val v = recentResiduals[parity].copyOf(n)
+        v.sort()
+        return v[n / 2].coerceIn(-maxWindowSamples, maxWindowSamples)
+    }
+
+    private fun recordOutcome(heard: Boolean) {
+        recentOutcomes[recentCount % recentOutcomes.size] = heard
+        recentCount++
+    }
+
+    private fun recentHitRate(): Double {
+        val n = minOf(recentCount, recentOutcomes.size)
+        if (n == 0) return 0.0
+        var hits = 0
+        for (i in 0 until n) if (recentOutcomes[i]) hits++
+        return hits.toDouble() / n
+    }
+
+    private fun refit() {
+        val profile = ClockProfile.forPeriod(model[2] / sampleRate, profiles)
+        val f = fitBeats(beats.map { it.k }, beats.map { it.parity }, beats.map { it.sample }, profile,
+            toothConfirmed) ?: return
+        fit = f
+        if (f.recognised != null && !toothConfirmed) {
+            toothConfirmed = true
+            logger?.log("CLOCK", "recognised the %s: its %d-tooth escape-wheel pattern matches the beats"
+                .format(profile.name, profile.escapeWheelTeeth))
+        }
+        model[0] = f.a0; model[1] = f.a1; model[2] = f.linePeriod
+        if (f.inliers >= 16) {
+            windowSamples = (4 * f.residualSigma).coerceIn(minWindowSamples, maxWindowSamples)
+        }
+        val toMicros = 1e6 / sampleRate
+        if (f.n0 >= 3 && f.n1 >= 3 && f.spanSamples >= 2 * f.period) {
+            periodMicros = f.period * toMicros
+            uncertaintyMicros = f.periodSigma * toMicros
+            imbalanceMicros = f.imbalance * toMicros
+            imbalanceUncertaintyMicros = f.imbalanceSigma * toMicros
+            recognisedClock = f.recognised
+            val secPerWeek = uncertaintyMicros / periodMicros * 604_800.0
+            synced = secPerWeek <= SYNCED_SEC_PER_WEEK && recentHitRate() >= 0.8
+        }
+        trace = beats.mapIndexed { i, b ->
+            TracePoint(
+                timeSeconds = (b.sample / sampleRate).toFloat(),
+                residualMillis = ((b.sample - (model[b.parity] + b.k * model[2])) * 1000 / sampleRate).toFloat(),
+                isTick = b.parity == 0,
+                inlier = f.inlier[i],
+            )
+        }
+        if (beats.size % 20 == 0) {
+            logger?.log("FIT", "period=%.1fµs ±%.1fµs imbalance=%.0f±%.0fµs rms=%.1fms beats=%d/%d window=±%.0fms clock=%s"
+                .format(periodMicros, uncertaintyMicros, imbalanceMicros, imbalanceUncertaintyMicros,
+                    f.residualSigma * 1000 / sampleRate, beats.size, slotsExamined,
+                    windowSamples * 1000 / sampleRate, f.recognised?.name ?: "not recognised"))
+        }
+    }
+
+    // ================================================================
+    //  Fit: t = a[parity] + P·k
+    // ================================================================
+
+    private class Fit(
+        /** The straight lines' offsets and shared period, used for predicting beats. */
+        val a0: Double, val a1: Double, val linePeriod: Double,
+        /** The best period estimate: per-tooth when the clock is recognised, else [linePeriod]. */
+        val period: Double,
+        /** The known clock whose tooth pattern the beats confirmed, or null. */
+        val recognised: ClockProfile?,
+        val inlier: BooleanArray, val inliers: Int,
+        val n0: Int, val n1: Int,
+        /** Robust scatter of the beats around the line, in samples. */
+        val residualSigma: Double,
+        /** Period uncertainty including slow wander, in samples. */
+        val periodSigma: Double,
+        val imbalance: Double, val imbalanceSigma: Double,
+        val spanSamples: Double,
+    )
+
+    /** Beats must be in time order. Returns null until each beat type has at least two beats. */
+    private fun fitBeats(
+        k: List<Int>, par: List<Int>, t: List<Double>, profile: ClockProfile, toothConfirmed: Boolean,
+    ): Fit? {
+        val n = t.size
+        if (n < 5) return null
+        var inl = BooleanArray(n) { true }
+        var line = lineFit(k, par, t, inl) ?: return null
+        val floor = samplesFor(0.002)
+        repeat(3) {
+            val r = DoubleArray(n) { t[it] - (line[par[it]] + line[2] * k[it]) }
+            val rIn = r.filterIndexed { i, _ -> inl[i] }
+            val med = median(rIn)
+            val sigma = 1.4826 * median(rIn.map { abs(it - med) })
+            val cutoff = maxOf(5 * sigma, floor)
+            val next = BooleanArray(n) { abs(r[it]) <= cutoff }
+            line = lineFit(k, par, t, next) ?: return null
+            inl = next
+        }
+        val a0 = line[0]; val a1 = line[1]; val p = line[2]
+        val r = DoubleArray(n) { t[it] - (line[par[it]] + p * k[it]) }
+
+        var n0 = 0; var n1 = 0; var ss = 0.0
+        val kMean = DoubleArray(2); val cnt = IntArray(2)
+        for (i in 0 until n) if (inl[i]) {
+            if (par[i] == 0) n0++ else n1++
+            ss += r[i] * r[i]
+            kMean[par[i]] += k[i].toDouble(); cnt[par[i]]++
+        }
+        val m = n0 + n1
+        if (n0 < 2 || n1 < 2 || m < 5) return null
+        for (g in 0..1) kMean[g] /= cnt[g]
+        var sxx = 0.0
+        for (i in 0 until n) if (inl[i]) { val d = k[i] - kMean[par[i]]; sxx += d * d }
+        val formal = sqrt(ss / (m - 3) / sxx)
+
+        val rr = r.filterIndexed { i, _ -> inl[i] }
+        val tIn = t.filterIndexed { i, _ -> inl[i] }
+        val span = tIn.last() - tIn.first()
+
+        // With a known clock whose tooth count the beats confirm, each tooth gets
+        // its own offset, which cancels the escape-wheel pattern exactly. That
+        // needs some teeth heard twice, so it starts after more than one turn.
+        var period = p
+        var periodFormal = formal
+        var periodResiduals = rr
+        var wanderPriorSeconds = ClockProfile.UNKNOWN.wanderSeconds
+        var recognised: ClockProfile? = null
+        val teeth = profile.escapeWheelTeeth
+        if (teeth > 0 && span >= MIN_TOOTH_TURNS * teeth * p) {
+            toothFit(k, par, t, inl, r, teeth, requireConfirmation = !toothConfirmed)?.let { tf ->
+                period = tf.period
+                periodFormal = tf.formal
+                periodResiduals = tf.residuals
+                wanderPriorSeconds = profile.wanderSeconds
+                recognised = profile
             }
         }
 
-        if (pairMidpoints.size < 4) return
+        // Wander slower than the span looks like a straight trend, so it hides in
+        // the slope and can't be seen in the residuals. A prior amplitude for such
+        // wander, taken from how real clocks behave, covers it.
+        val wander = slowWanderTerm(periodResiduals, span, period)
+        val wanderPrior = samplesFor(wanderPriorSeconds) / span * period
+        val periodSigma = UNCERTAINTY_SCALE *
+            sqrt(periodFormal * periodFormal + wander * wander + wanderPrior * wanderPrior)
 
-        // Step 2: assign indices on the half-period grid
-        val approxHalfPeriod = approxPeriodFrames / 2.0
-        val m = pairMidpoints.size
-        val indices = IntArray(m)
-        for (j in 1 until m) {
-            indices[j] = ((pairMidpoints[j] - pairMidpoints[0])
-                / approxHalfPeriod).roundToInt()
+        // Imbalance: tick→tock gap minus half the period. Its error is dominated by
+        // the tock-minus-tick difference of the escape wheel's repeating pattern.
+        // Averaging a bounded repeating pattern over n beats leaves an error of
+        // about amplitude × (pattern length / 2π) / n, i.e. a few times σ/n for a
+        // ~30-beat pattern; a short window sees only part of the pattern, so the
+        // factor is set higher. Beat-to-beat jitter adds the usual σ/√n, and the
+        // floor covers where exactly a tick's sound counts as starting.
+        val tickRes = HashMap<Int, Double>()
+        for (i in 0 until n) if (inl[i] && par[i] == 0) tickRes[k[i]] = r[i]
+        val d = ArrayList<Double>()
+        for (i in 0 until n) if (inl[i] && par[i] == 1) tickRes[k[i]]?.let { d += r[i] - it }
+        val imbalanceSigma = if (d.size >= 3) {
+            val nd = d.size.toDouble()
+            val pattern = IMBALANCE_PATTERN_FACTOR * std(d) / nd
+            val jitter = std(List(d.size - 1) { d[it + 1] - d[it] }) / sqrt(2.0)
+            val floor = samplesFor(IMBALANCE_FLOOR_SECONDS)
+            sqrt(pattern * pattern + jitter * jitter / nd + floor * floor)
+        } else 2 * std(rr)
+
+        val rrMedian = median(rr)
+        return Fit(
+            a0, a1, p, period, recognised, inl, m, n0, n1,
+            residualSigma = 1.4826 * median(rr.map { abs(it - rrMedian) }),
+            periodSigma = periodSigma,
+            imbalance = (a1 - a0) - p / 2,
+            imbalanceSigma = imbalanceSigma,
+            spanSamples = span,
+        )
+    }
+
+    /**
+     * Period error from slow wander: the change in the time-ordered residuals,
+     * smoothed over ~20 s, across the span, divided by the span.
+     */
+    private fun slowWanderTerm(residuals: List<Double>, span: Double, period: Double): Double {
+        val m = residuals.size
+        if (m < 3 || span <= 0) return 0.0
+        val w = maxOf(3, (samplesFor(LF_SMOOTH_SECONDS) / (period / 2)).roundToInt())
+        val slow = if (m > 2 * w) {
+            val sm = DoubleArray(m - w + 1)
+            var s = 0.0
+            for (i in 0 until m) {
+                s += residuals[i]
+                if (i >= w) s -= residuals[i - w]
+                if (i >= w - 1) sm[i - w + 1] = s / w
+            }
+            std(sm.toList())
+        } else {
+            std(residuals) / sqrt(maxOf(1.0, m.toDouble() / w))
+        }
+        return sqrt(2.0) * slow / span * period
+    }
+
+    private class ToothFit(
+        val period: Double, val formal: Double, val residuals: List<Double>,
+        /** Scatter of beats around their tooth's line, and around the straight line, for the same beats. */
+        val sigmaTooth: Double, val sigmaLine: Double,
+    )
+
+    /**
+     * Fits t = a[beat type, tooth] + P·k with tooth = k mod [teeth]. Only teeth
+     * heard at least twice inform P, so the per-tooth pattern cancels. With
+     * [requireConfirmation], returns null unless the beats confirm the tooth
+     * count. Beats of the same tooth must agree far better than beats around the
+     * straight line do, and clearly better than with one tooth more or fewer:
+     * the pattern changes smoothly from tooth to tooth, so a count that is off
+     * by one also cancels much of it. The check is reliable over the first few
+     * turns of the escape wheel; later, slow wander spreads same-tooth beats
+     * apart too, so a confirmation holds for the rest of the session.
+     */
+    private fun toothFit(
+        k: List<Int>, par: List<Int>, t: List<Double>, use: BooleanArray,
+        lineResiduals: DoubleArray, teeth: Int, requireConfirmation: Boolean,
+    ): ToothFit? {
+        val fit = toothFitFor(k, par, t, use, lineResiduals, teeth) ?: return null
+        if (requireConfirmation) {
+            val lower = toothFitFor(k, par, t, use, lineResiduals, teeth - 1)
+            val upper = toothFitFor(k, par, t, use, lineResiduals, teeth + 1)
+            logger?.log("TOOTH_CHECK", "teeth=%d sigma=%.2fms line=%.2fms neighbours=%.2f/%.2fms beats=%d".format(
+                teeth, fit.sigmaTooth * 1000 / sampleRate, fit.sigmaLine * 1000 / sampleRate,
+                (lower?.sigmaTooth ?: Double.NaN) * 1000 / sampleRate,
+                (upper?.sigmaTooth ?: Double.NaN) * 1000 / sampleRate, t.size))
+            if (fit.sigmaTooth > TOOTH_CONFIRM_RATIO * fit.sigmaLine) return null
+            for (alt in listOfNotNull(lower, upper)) {
+                if (fit.sigmaTooth > TOOTH_NEIGHBOUR_RATIO * alt.sigmaTooth) return null
+            }
+        }
+        return fit
+    }
+
+    private fun toothFitFor(
+        k: List<Int>, par: List<Int>, t: List<Double>, use: BooleanArray,
+        lineResiduals: DoubleArray, teeth: Int,
+    ): ToothFit? {
+        if (teeth < 2) return null
+        val groups = 2 * teeth
+        val cnt = IntArray(groups); val sk = DoubleArray(groups); val st = DoubleArray(groups)
+        val g = IntArray(t.size) { par[it] * teeth + k[it] % teeth }
+        for (i in t.indices) if (use[i]) { cnt[g[i]]++; sk[g[i]] += k[i].toDouble(); st[g[i]] += t[i] }
+        var sxy = 0.0; var sxx = 0.0
+        for (i in t.indices) if (use[i] && cnt[g[i]] >= 2) {
+            val dk = k[i] - sk[g[i]] / cnt[g[i]]
+            sxy += dk * (t[i] - st[g[i]] / cnt[g[i]]); sxx += dk * dk
+        }
+        if (sxx <= 0) return null
+        val p = sxy / sxx
+        val res = ArrayList<Double>()
+        var ssTooth = 0.0; var ssLine = 0.0
+        for (i in t.indices) if (use[i] && cnt[g[i]] >= 2) {
+            val r = t[i] - (st[g[i]] / cnt[g[i]] + p * (k[i] - sk[g[i]] / cnt[g[i]]))
+            res += r
+            ssTooth += r * r
+            ssLine += lineResiduals[i] * lineResiduals[i]
+        }
+        val repeated = (0 until groups).count { cnt[it] >= 2 }
+        val dof = res.size - repeated - 1
+        if (dof < 5) return null
+        return ToothFit(p, sqrt(ssTooth / dof / sxx), res, sqrt(ssTooth / dof), sqrt(ssLine / res.size))
+    }
+
+    /** Least squares with one offset per beat type and a shared slope; returns [a0, a1, P]. */
+    private fun lineFit(k: List<Int>, par: List<Int>, t: List<Double>, use: BooleanArray): DoubleArray? {
+        val sk = DoubleArray(2); val st = DoubleArray(2); val c = IntArray(2)
+        for (i in t.indices) if (use[i]) { sk[par[i]] += k[i].toDouble(); st[par[i]] += t[i]; c[par[i]]++ }
+        if (c[0] < 1 || c[1] < 1) return null
+        val km = DoubleArray(2) { sk[it] / c[it] }
+        val tm = DoubleArray(2) { st[it] / c[it] }
+        var sxy = 0.0; var sxx = 0.0
+        for (i in t.indices) if (use[i]) {
+            val dk = k[i] - km[par[i]]
+            sxy += dk * (t[i] - tm[par[i]]); sxx += dk * dk
+        }
+        if (sxx <= 0) return null
+        val p = sxy / sxx
+        if (p <= 0) return null
+        return doubleArrayOf(tm[0] - p * km[0], tm[1] - p * km[1], p)
+    }
+
+    // ================================================================
+    //  Full-recording refinement
+    // ================================================================
+
+    /**
+     * Refines every tracked beat to sub-sample precision by aligning it to an
+     * average template of its beat type in the saved recording, then refits.
+     */
+    fun analyzeWavFile(wavFile: File): State? {
+        if (beats.size < 8 || periodMicros <= 0) return null
+        val pre = (0.002 * sampleRate).toInt()
+        val post = (0.015 * sampleRate).toInt()
+        val search = (0.002 * sampleRate).toInt()
+        val width = pre + post
+        val clipHalf = pre + post + search + 2
+        val centers = IntArray(beats.size) { beats[it].sample.roundToInt() }
+        val clips = readDiffClips(wavFile, centers, clipHalf) ?: return null
+
+        fun window(clip: ShortArray, off: Int): DoubleArray =
+            DoubleArray(width) { j -> clip[clipHalf - pre + off + j].toDouble() }
+
+        fun correlation(tpl: DoubleArray, clip: ShortArray, off: Int): Double {
+            var dot = 0.0; var e = 1e-12
+            for (j in 0 until width) {
+                val s = clip[clipHalf - pre + off + j].toDouble()
+                dot += tpl[j] * s; e += s * s
+            }
+            return dot / sqrt(e)
         }
 
-        // Step 3: linear regression — midpoint[j] = t0 + indices[j] * halfP
-        var sk = 0.0; var skk = 0.0; var sp = 0.0; var skp = 0.0
-        for (j in 0 until m) {
-            val k = indices[j].toDouble()
-            val p = pairMidpoints[j]
-            sk += k; skk += k * k; sp += p; skp += k * p
+        fun bestOffset(tpl: DoubleArray, clip: ShortArray, around: Int, radius: Int): Int {
+            var best = around; var bestScore = Double.NEGATIVE_INFINITY
+            for (off in maxOf(-search, around - radius)..minOf(search, around + radius)) {
+                val sc = correlation(tpl, clip, off)
+                if (sc > bestScore) { bestScore = sc; best = off }
+            }
+            return best
         }
 
-        val det = m.toDouble() * skk - sk * sk
-        if (abs(det) < 1e-12) return
-
-        val t0 = (skk * sp - sk * skp) / det
-        val halfP = (m.toDouble() * skp - sk * sp) / det
-        if (halfP <= 0) return
-
-        val period = halfP * 2.0  // full tick-to-tick period
-
-        // Residuals and uncertainty
-        var sumResidualSq = 0.0
-        for (j in 0 until m) {
-            val expected = t0 + indices[j] * halfP
-            val residual = pairMidpoints[j] - expected
-            sumResidualSq += residual * residual
+        fun template(members: List<Int>, offsets: IntArray): DoubleArray {
+            val tpl = DoubleArray(width)
+            for (i in members) {
+                val win = window(clips[i], offsets[i])
+                val norm = sqrt(win.sumOf { it * it })
+                if (norm > 1e-9) for (j in 0 until width) tpl[j] += win[j] / norm
+            }
+            val norm = sqrt(tpl.sumOf { it * it })
+            if (norm > 1e-9) for (j in 0 until width) tpl[j] /= norm
+            return tpl
         }
 
-        val sigma2 = if (m > 2) sumResidualSq / (m - 2) else 0.0
-        // var(halfP) = σ² · N / det; var(period) = 4 · var(halfP)
-        val halfPVar = if (abs(det) > 1e-20 && m > 2) m.toDouble() / det * sigma2 else 0.0
+        val offsets = IntArray(beats.size)
+        val precise = DoubleArray(beats.size)
+        for (parity in 0..1) {
+            val members = beats.indices.filter { beats[it].parity == parity }
+            if (members.size < 3) return null
+            // The first alignment searches the full range; later ones only refine
+            // around the previous offset, which keeps long recordings fast.
+            val fine = (0.0003 * sampleRate).toInt()
+            var tpl = template(members, offsets)
+            for (i in members) offsets[i] = bestOffset(tpl, clips[i], 0, search)
+            tpl = template(members, offsets)
+            for (i in members) offsets[i] = bestOffset(tpl, clips[i], offsets[i], fine)
+            tpl = template(members, offsets)
+            for (i in members) {
+                val o = bestOffset(tpl, clips[i], offsets[i], fine)
+                val frac = if (abs(o) < search) parabolicOffset(
+                    correlation(tpl, clips[i], o - 1), correlation(tpl, clips[i], o),
+                    correlation(tpl, clips[i], o + 1)) else 0.0
+                precise[i] = centers[i] + o + frac
+            }
+        }
+        refinedBeatSamples = beats.indices.associateWith { precise[it] }
 
-        val framesToMicros = frameSamples.toDouble() / sampleRate * 1_000_000.0
-        periodMicros = period * framesToMicros
-        uncertaintyMicros = if (halfPVar > 0) 2.0 * sqrt(halfPVar) * framesToMicros else 0.0
-        method = Method.BEST_FIT
+        val f = fitBeats(beats.map { it.k }, beats.map { it.parity }, precise.toList(),
+            ClockProfile.forPeriod(model[2] / sampleRate, profiles), toothConfirmed) ?: return null
+        val toMicros = 1e6 / sampleRate
+        logger?.log("WAV_RESULT", "period=%.1fµs ±%.1fµs imbalance=%.0f±%.0fµs inliers=%d/%d rms=%.2fms"
+            .format(f.period * toMicros, f.periodSigma * toMicros, f.imbalance * toMicros,
+                f.imbalanceSigma * toMicros, f.inliers, beats.size, f.residualSigma * 1000 / sampleRate))
+        return State(
+            periodMicros = f.period * toMicros,
+            uncertaintyMicros = f.periodSigma * toMicros,
+            tickCount = tickCount,
+            beatCount = beats.size,
+            elapsedSamples = totalSamples,
+            synced = true,
+            method = Method.WAV_REFINED,
+            imbalanceMicros = f.imbalance * toMicros,
+            imbalanceUncertaintyMicros = f.imbalanceSigma * toMicros,
+            listening = false,
+            beatsExpected = slotsExamined,
+            recognisedClock = f.recognised,
+        )
+    }
 
-        val rmsResidual = if (m > 2) sqrt(sigma2) else 0.0
-        synced = uncertaintyMicros > 0 && uncertaintyMicros < periodMicros * 0.001
-
-        logger?.log("BEST_FIT",
-            "period=%.2f frames (%.1fµs ±%.1fµs) pairs=%d rms=%.2f synced=%s"
-                .format(period, periodMicros, uncertaintyMicros, m, rmsResidual, synced))
+    /**
+     * Reads a clip of 2·[clipHalf] samples centred on each position, as
+     * sample-to-sample differences (which emphasise the tick's high frequencies).
+     */
+    private fun readDiffClips(file: File, centers: IntArray, clipHalf: Int): Array<ShortArray>? = try {
+        RandomAccessFile(file, "r").use { raf ->
+            val total = ((raf.length() - 44) / 2).toInt()
+            val size = 2 * clipHalf
+            Array(centers.size) { i ->
+                val clip = ShortArray(size)
+                val start = centers[i] - clipHalf
+                val from = maxOf(0, start - 1)
+                val to = minOf(total, start + size)
+                if (to > from + 1) {
+                    raf.seek(44L + from.toLong() * 2)
+                    val bytes = ByteArray((to - from) * 2)
+                    raf.readFully(bytes)
+                    val bb = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+                    var prev = bb.short.toInt()
+                    for (p in from + 1 until to) {
+                        val s = bb.short.toInt()
+                        val idx = p - start
+                        if (idx in 0 until size) clip[idx] = (s - prev).coerceIn(-32768, 32767).toShort()
+                        prev = s
+                    }
+                }
+                clip
+            }
+        }
+    } catch (_: Exception) {
+        null
     }
 
     // ================================================================
     //  Helpers
     // ================================================================
 
-    private fun writeIdealizedWav(
-        file: File,
-        tick: ShortArray,
-        tock: ShortArray,
-        silenceAfterTick: Int,
-        silenceAfterTock: Int,
-    ) {
-        val repeats = 10
-        val cycleSamples = tick.size + silenceAfterTick + tock.size + silenceAfterTock
-        val totalSamples = cycleSamples * repeats
-        val samples = ShortArray(totalSamples)
-        for (r in 0 until repeats) {
-            var pos = r * cycleSamples
-            tick.copyInto(samples, pos); pos += tick.size
-            pos += silenceAfterTick  // silence: already zero
-            tock.copyInto(samples, pos)
-        }
-
-        val dataSize = totalSamples * 2
-        RandomAccessFile(file, "rw").use { raf ->
-            raf.setLength(0)
-            val header = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN)
-            header.put("RIFF".toByteArray())
-            header.putInt(36 + dataSize)
-            header.put("WAVE".toByteArray())
-            header.put("fmt ".toByteArray())
-            header.putInt(16)              // subchunk1 size
-            header.putShort(1)             // PCM format
-            header.putShort(1)             // mono
-            header.putInt(sampleRate)
-            header.putInt(sampleRate * 2)  // byte rate
-            header.putShort(2)             // block align
-            header.putShort(16)            // bits per sample
-            header.put("data".toByteArray())
-            header.putInt(dataSize)
-            raf.write(header.array())
-
-            val data = ByteBuffer.allocate(dataSize).order(ByteOrder.LITTLE_ENDIAN)
-            for (s in samples) data.putShort(s)
-            raf.write(data.array())
-        }
+    private fun parabolicOffset(y0: Double, y1: Double, y2: Double): Double {
+        val den = y0 - 2 * y1 + y2
+        return if (abs(den) > 1e-12) (0.5 * (y0 - y2) / den).coerceIn(-0.5, 0.5) else 0.0
     }
 
-    /**
-     * Read clips from a WAV file centered on each beat position.
-     * Each clip is 2 * [clipHalfWidth] samples wide, centered on the
-     * beat's sample position (beats[i] * [frameSamples]).
-     * When [diff] is true, returns sample-to-sample differences
-     * clipped to 16-bit range (first element of each clip is 0).
-     */
-    private fun readWav(
-        file: File,
-        beats: List<Int>,
-        clipHalfWidth: Int,
-        diff: Boolean = false,
-    ): Array<ShortArray>? {
-        return try {
-            RandomAccessFile(file, "r").use { raf ->
-                val totalFileSamples = ((raf.length() - 44) / 2).toInt()
-                val clipSize = 2 * clipHalfWidth
+    private fun median(v: List<Double>): Double {
+        if (v.isEmpty()) return 0.0
+        val s = v.sorted()
+        return s[s.size / 2]
+    }
 
-                Array(beats.size) { i ->
-                    val centerSample = beats[i] * frameSamples
-                    val clipStart = centerSample - clipHalfWidth
-                    val clip = ShortArray(clipSize)
+    private fun std(v: List<Double>): Double {
+        if (v.size < 2) return 0.0
+        val m = v.average()
+        return sqrt(v.sumOf { (it - m) * (it - m) } / (v.size - 1))
+    }
 
-                    val readStart = maxOf(0, clipStart)
-                    val readEnd = minOf(totalFileSamples, clipStart + clipSize)
-                    if (readEnd <= readStart) return@Array clip
+    private fun std(v: DoubleArray) = std(v.toList())
 
-                    val clipOffset = readStart - clipStart
-                    val samplesToRead = readEnd - readStart
+    /** Second-order IIR section, transposed direct form II. */
+    private class Biquad(
+        private val b0: Double, private val b1: Double, private val b2: Double,
+        private val a1: Double, private val a2: Double,
+    ) {
+        private var z1 = 0.0
+        private var z2 = 0.0
 
-                    raf.seek(44L + readStart.toLong() * 2L)
-                    val bytes = ByteArray(samplesToRead * 2)
-                    raf.readFully(bytes)
-                    val bb = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+        fun process(x: Double): Double {
+            val y = b0 * x + z1
+            z1 = b1 * x - a1 * y + z2
+            z2 = b2 * x - a2 * y
+            return y
+        }
 
-                    if (diff) {
-                        var prev: Short = 0
-                        for (j in 0 until samplesToRead) {
-                            val s = bb.short
-                            if (j == 0) {
-                                clip[clipOffset] = 0
-                            } else {
-                                clip[clipOffset + j] =
-                                    (s - prev).coerceIn(-32768, 32767).toShort()
-                            }
-                            prev = s
-                        }
-                    } else {
-                        for (j in 0 until samplesToRead) {
-                            clip[clipOffset + j] = bb.short
-                        }
-                    }
+        fun reset() { z1 = 0.0; z2 = 0.0 }
 
-                    clip
-                }
+        companion object {
+            fun highPass(f: Double, q: Double, sr: Int): Biquad {
+                val w = 2 * PI * f / sr; val c = cos(w); val alpha = sin(w) / (2 * q); val a0 = 1 + alpha
+                return Biquad((1 + c) / 2 / a0, -(1 + c) / a0, (1 + c) / 2 / a0, -2 * c / a0, (1 - alpha) / a0)
             }
-        } catch (_: Exception) {
-            null
+
+            fun lowPass(f: Double, q: Double, sr: Int): Biquad {
+                val w = 2 * PI * f / sr; val c = cos(w); val alpha = sin(w) / (2 * q); val a0 = 1 + alpha
+                return Biquad((1 - c) / 2 / a0, (1 - c) / a0, (1 - c) / 2 / a0, -2 * c / a0, (1 - alpha) / a0)
+            }
         }
     }
 
@@ -1035,38 +1012,31 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
     // ================================================================
 
     private fun fft(data: DoubleArray, n: Int) {
-        // Bit-reversal permutation
         var j = 0
         for (i in 0 until n) {
             if (j > i) {
-                val tr = data[2 * j];     val ti = data[2 * j + 1]
+                val tr = data[2 * j]; val ti = data[2 * j + 1]
                 data[2 * j] = data[2 * i]; data[2 * j + 1] = data[2 * i + 1]
-                data[2 * i] = tr;          data[2 * i + 1] = ti
+                data[2 * i] = tr; data[2 * i + 1] = ti
             }
             var m = n shr 1
             while (m >= 1 && j >= m) { j -= m; m = m shr 1 }
             j += m
         }
-
-        // Butterfly passes
         var halfSize = 1
         while (halfSize < n) {
             val step = halfSize shl 1
             val angle = -PI / halfSize
-            val wpr = cos(angle)
-            val wpi = sin(angle)
-            var wr = 1.0
-            var wi = 0.0
+            val wpr = cos(angle); val wpi = sin(angle)
+            var wr = 1.0; var wi = 0.0
             for (m in 0 until halfSize) {
                 var i = m
                 while (i < n) {
                     val k = i + halfSize
                     val tr = wr * data[2 * k] - wi * data[2 * k + 1]
                     val ti = wr * data[2 * k + 1] + wi * data[2 * k]
-                    data[2 * k]     = data[2 * i] - tr
-                    data[2 * k + 1] = data[2 * i + 1] - ti
-                    data[2 * i]     += tr
-                    data[2 * i + 1] += ti
+                    data[2 * k] = data[2 * i] - tr; data[2 * k + 1] = data[2 * i + 1] - ti
+                    data[2 * i] += tr; data[2 * i + 1] += ti
                     i += step
                 }
                 val tmp = wr * wpr - wi * wpi
@@ -1075,5 +1045,40 @@ class TickDetector(private val sampleRate: Int = AudioCapture.SAMPLE_RATE) {
             }
             halfSize = step
         }
+    }
+
+    companion object {
+        /** The result counts as settled once its uncertainty is within this many seconds per week. */
+        const val SYNCED_SEC_PER_WEEK = 10.0
+        /** Share of periods in which each beat must be heard before the rhythm counts as found. */
+        private const val MIN_LOCK_COVERAGE = 0.6
+        /**
+         * A clock's tooth count counts as confirmed when beats of the same tooth
+         * scatter less than this fraction of the scatter around the straight line.
+         */
+        private const val TOOTH_CONFIRM_RATIO = 0.5
+        /** ...and less than this fraction of the scatter with one tooth more or fewer. */
+        private const val TOOTH_NEIGHBOUR_RATIO = 0.8
+        /** Escape-wheel turns heard before the per-tooth model is tried (some teeth must be heard twice). */
+        private const val MIN_TOOTH_TURNS = 1.2
+        /** Smoothing span for estimating slow wander of the beats around the fitted line. */
+        private const val LF_SMOOTH_SECONDS = 20.0
+        /**
+         * Calibration factor for the period uncertainty, tuned with
+         * TickDetectorEvaluationTest so that errors against the offline references
+         * come out at about one shown uncertainty (rms).
+         */
+        private const val UNCERTAINTY_SCALE = 1.0
+        /**
+         * Typical amplitude of slow beat-timing wander over minutes. Measured on
+         * 15-minute recordings: about 3 ms for Nattich (81 BPM), 6.7 ms for
+         * Medusa (104 BPM); the larger value is used so the uncertainty errs on the
+         * safe side for a clock the app hasn't seen.
+         */
+        private const val WANDER_PRIOR_SECONDS = 0.006
+        /** Error of the imbalance from its repeating pattern, in units of the pattern's scatter over beats heard. */
+        private const val IMBALANCE_PATTERN_FACTOR = 8.0
+        /** Ambiguity in where a beat's sound counts as starting, which limits the imbalance. */
+        private const val IMBALANCE_FLOOR_SECONDS = 0.002
     }
 }

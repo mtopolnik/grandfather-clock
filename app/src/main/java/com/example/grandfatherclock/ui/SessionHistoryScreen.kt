@@ -47,6 +47,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.grandfatherclock.audio.ClockProfile
 import com.example.grandfatherclock.data.SessionRecord
 import com.example.grandfatherclock.data.SessionStore
 import java.text.SimpleDateFormat
@@ -109,7 +110,7 @@ fun SessionHistoryScreen(
                         Tab(
                             selected = clampedTab == index,
                             onClick = { selectedTab = index },
-                            text = { Text("$bpm BPM") },
+                            text = { Text(ClockProfile.nameForBpm(bpm)) },
                         )
                     }
                 }

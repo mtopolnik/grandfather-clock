@@ -6,6 +6,7 @@ import java.io.FileWriter
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import kotlin.math.roundToInt
 
 class TickDetectorSimulationTest {
 
@@ -90,51 +91,20 @@ class TickDetectorSimulationTest {
      */
     private fun writeBeatsJson(detector: TickDetector, outputDir: File) {
         val sampleRate = 44100
-        val frameSamples = sampleRate / 200  // 220 samples per 5ms frame
-        val beatFrames = detector.detectedBeatFrames
-        val seqIndices = detector.detectedBeatSequenceIndices
+        val beats = detector.detectedBeats
         val refined = detector.refinedBeatSamples
 
         val outFile = File(outputDir, "beats.json")
         FileWriter(outFile).use { w ->
-            w.write("{\"sampleRate\":$sampleRate,\"frameSamples\":$frameSamples,\"beats\":[")
-            for ((i, frame) in beatFrames.withIndex()) {
-                val samplePos = frame * frameSamples
-                val timeSec = samplePos.toDouble() / sampleRate
-                val seqIdx = if (i < seqIndices.size) seqIndices[i] else i
-                val isTick = (seqIdx % 2 == 0)
-
-                val timeSincePrev = if (i > 0) {
-                    val prevSample = beatFrames[i - 1] * frameSamples
-                    (samplePos - prevSample).toDouble() / sampleRate
-                } else 0.0
-
-                val avgPeriod = if (i > 0) {
-                    val firstSample = beatFrames[0] * frameSamples
-                    (samplePos - firstSample).toDouble() / sampleRate / i
-                } else 0.0
-
+            w.write("{\"sampleRate\":$sampleRate,\"beats\":[")
+            for ((i, beat) in beats.withIndex()) {
+                val samplePos = beat.sample.roundToInt()
+                val sincePrev = if (i > 0) (beat.sample - beats[i - 1].sample) / sampleRate else 0.0
                 if (i > 0) w.write(",")
-                w.write("{\"sample\":$samplePos,\"time\":%.6f,\"isTick\":$isTick,\"seqIndex\":$seqIdx".format(timeSec))
-                w.write(",\"sincePrev\":%.6f,\"avgPeriod\":%.6f,\"index\":$i".format(timeSincePrev, avgPeriod))
-
-                val refPos = refined[i]
-                if (refPos != null) {
-                    val refTime = refPos / sampleRate
-                    val refSincePrev = if (i > 0) {
-                        val prevRef = refined[i - 1]
-                        val prevSamp = prevRef ?: (beatFrames[i - 1] * frameSamples).toDouble()
-                        (refPos - prevSamp) / sampleRate
-                    } else 0.0
-                    // Average period using only refined beats from the first refined beat
-                    val firstRefIdx = refined.keys.min()
-                    val firstRefPos = refined[firstRefIdx]!!
-                    val refAvgPeriod = if (i > firstRefIdx) {
-                        (refPos - firstRefPos) / sampleRate / (i - firstRefIdx)
-                    } else 0.0
-                    w.write(",\"refined\":%.2f,\"refTime\":%.6f,\"refSincePrev\":%.6f,\"refAvgPeriod\":%.6f"
-                        .format(refPos, refTime, refSincePrev, refAvgPeriod))
-                }
+                w.write("{\"sample\":$samplePos,\"time\":%.6f,\"isTick\":%s,\"seqIndex\":%d"
+                    .format(beat.sample / sampleRate, beat.parity == 0, 2 * beat.k + beat.parity))
+                w.write(",\"sincePrev\":%.6f,\"snr\":%.1f,\"index\":$i".format(sincePrev, beat.snr))
+                refined[i]?.let { w.write(",\"refined\":%.2f,\"refTime\":%.6f".format(it, it / sampleRate)) }
                 w.write("}")
             }
             w.write("]}")

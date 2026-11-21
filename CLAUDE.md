@@ -22,13 +22,31 @@ WAV_FILE=/path/to/clock_recording.wav ./gradlew testDebugUnitTest \
 
 The test also checks `~/Desktop/clock_recording.wav` as a fallback. It writes a `session.log` next to the WAV file with detailed detection traces.
 
-To pull recordings from a connected device:
+### Evaluation against references
+
+`TickDetectorEvaluationTest` judges the detector against offline reference values. `tools/reference.py` (numpy/scipy) computes, for every WAV under `~/Desktop/grandfather-clock`, the full-length period and imbalance from precisely timed beats, and stores them in `tools/eval/references.json`. Run it again after adding recordings:
 
 ```bash
-adb pull /storage/emulated/0/Android/data/com.example.grandfatherclock/files/ /dest/
+python3 -I tools/reference.py            # all WAVs under the default root
+./gradlew testDebugUnitTest --rerun --tests "com.example.grandfatherclock.audio.TickDetectorEvaluationTest"
 ```
 
-That directory contains `clock_recording.wav`, `clock_idealized.wav`, and `session.log`.
+The evaluation replays every recording (long ones also as several sessions starting at different offsets) and reports, per listening time, the actual error, the uncertainty the app shows, z = error / shown uncertainty (honest ≈ 1 rms), wrong-period failures, and beats heard. The report goes to stdout and `app/build/reports/evaluation.txt`. `EVAL_ROOT` overrides the recordings folder; `EVAL_LOG=<path>@<startSeconds>` replays one session with the detector's log written to `app/build/reports/eval-log/session.log`. `noClockNeverLocks` checks that noise with irregular clicks never produces a rhythm.
+
+### Replaying a recording through the app
+
+Debug builds accept a WAV to play in place of the microphone (useful on the emulator):
+
+```bash
+adb shell am start -n com.example.grandfatherclock/.MainActivity \
+  --es replay_wav /sdcard/Android/data/com.example.grandfatherclock/files/x.wav --ef replay_speed 4
+```
+
+Each session is kept in its own folder under `files/recordings/`, named after its local start time. Once the analysis has run, the folder name also carries the clock: its name for a known clock (e.g. `2026-11-21_14-30-05_Nattich`), otherwise the measured beat rate (e.g. `2026-11-21_14-30-05_81bpm`). A session folder contains `clock_recording.wav`, `session.log`, and `info.json` (start time, duration, measured periods, measured sample rate, device). To pull all sessions from a connected device:
+
+```bash
+adb pull /storage/emulated/0/Android/data/com.example.grandfatherclock/files/recordings /dest/
+```
 
 ## Project Overview
 
@@ -45,16 +63,27 @@ Single-activity, single-screen app with three layers:
 - **`MainViewModel`** — Owns `UiState` as a `StateFlow`. Coordinates `AudioCapture` and `TickDetector`. Start/stop lifecycle management.
 - **Audio layer** (`audio/` package):
   - **`AudioCapture`** — Runs an `AudioRecord` on a dedicated high-priority thread at 44100 Hz mono 16-bit PCM. Streams `ShortArray` buffers to a callback. Optionally writes a WAV file (header patched on stop).
-  - **`TickDetector`** — Stateful DSP engine. Processes PCM buffers sample-by-sample to detect tick/tock beats. Key algorithms: adaptive asymmetric noise floor (fast-down/slow-up EMA), peak detection with a 5ms trigger window, dead zone (~600ms) between beats, interval validation against running median to reject false triggers, and missed-beat detection (~2x median gap).
+  - **`TickDetector`** — Stateful DSP engine:
+    1. Band-pass 2–10 kHz, RMS envelope in ~1 ms hops.
+    2. Acquire: autocorrelate the onset strength, then fold the onsets at half/equal/double the candidate period. The period is the shortest candidate whose fold shows a tick/tock pair 40–60% of a period apart, each heard in ≥60% of periods; two consecutive attempts must agree.
+    3. Track: examine each predicted beat slot (per beat type, following recent offsets) and take the strongest onset in a ±25–60 ms window; quiet slots are missed beats.
+    4. Fit t = a[tick|tock] + P·k by robust least squares. The uncertainty adds a slow-wander term to the formal error, because beat timing wanders in a correlated way (escape-wheel pattern of about ±14 ms per tooth, slow drift over minutes).
+    5. `analyzeWavFile` refines beats by per-type template matching on the saved WAV and refits.
+  - **`ClockProfile`** — Known clocks: Nattich (81 BPM, 30-tooth escape wheel, ~3.5 ms wander) and Medusa (104 BPM, 26 teeth, ~6.5 ms wander). Their names label session folders and history tabs. A clock is matched by BPM, then recognised only once its beats confirm the tooth count. After about 1.2 wheel turns, beats of the same tooth must scatter less than half as much as around the straight line, and less than 0.8× as much as with one tooth more or fewer. Recognition holds for the session. A recognised clock gets a per-tooth fit (each tooth its own offset, cancelling the pattern) and its own wander amplitude in the uncertainty; others use the generic fit and a cautious 6 ms. `recognitionNeedsTheRightToothCount` checks that wrong tooth counts are never accepted.
+
+## Measurement limits
+
+The clocks' own timing irregularity, not the DSP, limits accuracy. Both clocks repeat a ±10–14 ms per-tooth pattern once per escape-wheel turn (30 periods for Nattich, 26 for Medusa) and wander slowly over minutes, by about ±3 ms (Nattich) and ±6–7 ms (Medusa). Typical live errors at 15 s / 1 min / 2 min / 4 min: Nattich ≈ 1000 / 60 / 40 / 18 µs, Medusa ≈ 450 / 90 / 58 / 35 µs (1 µs ≈ 0.4 s/week). Wander slower than the listening window can't be seen from inside it, so the uncertainty includes a prior wander amplitude (`WANDER_PRIOR_SECONDS`).
 
 ## UI
 
-Single Compose screen (`ClockTunerScreen`): flashing circle indicator (teal=tick, orange=tock, gray=idle), period display in µs with uncertainty, tick/beat counters, elapsed time, WAV save path, and start/stop button. Uses `FlashingCircle` with `LaunchedEffect` + `animateColorAsState`.
+Single Compose screen (`ClockTunerScreen`): flashing circle (teal=tick, orange=tock), live rate in s/week with uncertainty, a status line (finding the beat / beats heard / warnings when the beat can't be found or beats are being missed), beat imbalance, a timegrapher-style trace of each beat's offset from the fitted line, a rate-over-time chart with its uncertainty band, the full-recording result after stop, start/stop, duration selector and elapsed time.
 
 ## Key Constants
 
 - Sample rate: 44100 Hz (`AudioCapture.SAMPLE_RATE`)
-- Dead zone: 600ms between beats
-- Trigger window: 5ms for peak detection
-- Threshold: 5× noise floor, minimum 700
-- Noise floor EMA: α=0.001 down, α=0.0001 up
+- Envelope hop: 44 samples (~1 ms); band 2–10 kHz
+- Acquisition: from 6 s of audio, retried every second, last 20 s used
+- Beat accepted at ≥ 3.5× the local noise floor (median envelope over 1.5 s)
+- "Synced" (green): uncertainty ≤ 10 s/week and ≥ 80% of recent beats heard (`TickDetector.SYNCED_SEC_PER_WEEK`)
+- Uncertainty calibration: `WANDER_PRIOR_SECONDS` (6 ms), `UNCERTAINTY_SCALE`, `IMBALANCE_PATTERN_FACTOR`, `IMBALANCE_FLOOR_SECONDS` in `TickDetector`, tuned with the evaluation test

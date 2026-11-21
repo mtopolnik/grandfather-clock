@@ -15,6 +15,13 @@ class AudioCapture(
     /** Called on the capture thread when recording fails; capture has ended by then. */
     private val onError: (Exception) -> Unit = {},
     private val wavOutputDir: File? = null,
+    /**
+     * For development: a 44.1 kHz mono 16-bit WAV to play through the pipeline
+     * in place of the microphone, at [replaySpeed] times real time. Reaching
+     * its end is reported through [onError].
+     */
+    private val replayWav: File? = null,
+    private val replaySpeed: Double = 1.0,
 ) {
     companion object {
         const val SAMPLE_RATE = 44100
@@ -58,8 +65,38 @@ class AudioCapture(
      * failure (microphone unavailable, read error, storage full) ends the
      * capture and reaches [onError] instead of crashing the process.
      */
+    private fun replayLoop(source: File) {
+        // The source stands in for the recording, so the analysis after stop reads it.
+        wavFile = source
+        try {
+            RandomAccessFile(source, "r").use { input ->
+                input.seek(44)
+                val chunk = 882
+                val bytes = ByteArray(chunk * 2)
+                val buffer = ShortArray(chunk)
+                val start = System.nanoTime()
+                while (recording) {
+                    val n = input.read(bytes)
+                    if (n <= 0) throw IllegalStateException("Replay finished")
+                    val samples = n / 2
+                    ByteBuffer.wrap(bytes, 0, samples * 2).order(ByteOrder.LITTLE_ENDIAN)
+                        .asShortBuffer().get(buffer, 0, samples)
+                    onBuffer(buffer, samples)
+                    totalSamplesRead += samples
+                    val dueNanos = (totalSamplesRead * 1e9 / SAMPLE_RATE / replaySpeed).toLong()
+                    val wait = dueNanos - (System.nanoTime() - start)
+                    if (wait > 0) Thread.sleep(wait / 1_000_000, (wait % 1_000_000).toInt())
+                }
+            }
+        } catch (e: Exception) {
+            recording = false
+            onError(e)
+        }
+    }
+
     @SuppressLint("MissingPermission")
     private fun captureLoop() {
+        replayWav?.let { replayLoop(it); return }
         var audioRecord: AudioRecord? = null
         var raf: RandomAccessFile? = null
         try {
