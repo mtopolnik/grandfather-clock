@@ -190,5 +190,17 @@
     "lockConfidence": 0.344,
     "phase0Samples": 10968.4,
     "phase1Samples": 35904.0
+  },
+  "recordings/2026-11-21_18-43-07_Nattich/clock_recording.wav": {
+    "durationSeconds": 1800.24,
+    "periodMicros": 1481242.48,
+    "imbalanceMicros": 30554.3,
+    "beatsFound": 2429,
+    "beatsInlier": 2425,
+    "beatsExpected": 2429,
+    "residualRmsMicros": 8182.0,
+    "lockConfidence": 0.258,
+    "phase0Samples": 18040.9,
+    "phase1Samples": 52049.8
   }
 }
