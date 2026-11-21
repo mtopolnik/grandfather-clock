@@ -50,6 +50,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
@@ -603,39 +604,40 @@ private fun ProgressChart(
         Canvas(modifier = Modifier.fillMaxWidth().weight(1f)) {
             val tMax = maxOf(last.elapsedSeconds, 1f)
             fun x(t: Float) = t / tMax * size.width
+            // Points outside the view keep their true position, so segments leave
+            // the chart where they cross its edge. The limit only keeps wild early
+            // estimates within float range; it moves edge crossings by under a pixel.
             fun y(v: Double) = (size.height / 2 - (v - center) / range * size.height / 2)
-                .toFloat().coerceIn(0f, size.height)
-            val band = Path().apply {
-                history.forEachIndexed { i, h ->
-                    val px = x(h.elapsedSeconds)
-                    val py = y(rate(h.periodMicros) + spread(h.uncertaintyMicros))
-                    if (i == 0) moveTo(px, py) else lineTo(px, py)
+                .coerceIn(-1e6, 1e6).toFloat()
+            clipRect {
+                val band = Path().apply {
+                    history.forEachIndexed { i, h ->
+                        val px = x(h.elapsedSeconds)
+                        val py = y(rate(h.periodMicros) + spread(h.uncertaintyMicros))
+                        if (i == 0) moveTo(px, py) else lineTo(px, py)
+                    }
+                    for (h in history.asReversed()) {
+                        lineTo(x(h.elapsedSeconds), y(rate(h.periodMicros) - spread(h.uncertaintyMicros)))
+                    }
+                    close()
                 }
-                for (h in history.asReversed()) {
-                    lineTo(x(h.elapsedSeconds), y(rate(h.periodMicros) - spread(h.uncertaintyMicros)))
+                drawPath(band, lineColor.copy(alpha = 0.2f))
+                if (abs(center) < range) {
+                    drawLine(
+                        axis, Offset(0f, y(0.0)), Offset(size.width, y(0.0)),
+                        strokeWidth = 1.dp.toPx(),
+                        pathEffect = PathEffect.dashPathEffect(floatArrayOf(6.dp.toPx(), 4.dp.toPx())),
+                    )
                 }
-                close()
-            }
-            drawPath(band, lineColor.copy(alpha = 0.2f))
-            if (abs(center) < range) {
-                drawLine(
-                    axis, Offset(0f, y(0.0)), Offset(size.width, y(0.0)),
-                    strokeWidth = 1.dp.toPx(),
-                    pathEffect = PathEffect.dashPathEffect(floatArrayOf(6.dp.toPx(), 4.dp.toPx())),
-                )
-            }
-            // The line is drawn only where the estimate is inside the view; early
-            // on, the band filling the whole height shows the uncertainty instead.
-            val line = Path().apply {
-                var drawing = false
-                for (h in history) {
-                    val v = rate(h.periodMicros)
-                    if (abs(v - center) > range) { drawing = false; continue }
-                    if (drawing) lineTo(x(h.elapsedSeconds), y(v)) else moveTo(x(h.elapsedSeconds), y(v))
-                    drawing = true
+                val line = Path().apply {
+                    history.forEachIndexed { i, h ->
+                        val px = x(h.elapsedSeconds)
+                        val py = y(rate(h.periodMicros))
+                        if (i == 0) moveTo(px, py) else lineTo(px, py)
+                    }
                 }
+                drawPath(line, lineColor, style = Stroke(width = 2.dp.toPx()))
             }
-            drawPath(line, lineColor, style = Stroke(width = 2.dp.toPx()))
         }
     }
 }
