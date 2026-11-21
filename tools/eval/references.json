@@ -178,5 +178,17 @@
     "lockConfidence": 0.26,
     "phase0Samples": 17813.7,
     "phase1Samples": 52863.0
+  },
+  "recordings/2026-11-21_15-36-12_Medusa/clock_recording.wav": {
+    "durationSeconds": 1800.24,
+    "periodMicros": 1153691.57,
+    "imbalanceMicros": -11414.1,
+    "beatsFound": 3118,
+    "beatsInlier": 3118,
+    "beatsExpected": 3119,
+    "residualRmsMicros": 18409.1,
+    "lockConfidence": 0.344,
+    "phase0Samples": 10968.4,
+    "phase1Samples": 35904.0
   }
 }
