@@ -52,6 +52,8 @@ tasks.withType<Test> {
     // Forward WAV_FILE env var and project root to the test JVM
     environment("WAV_FILE", System.getenv("WAV_FILE") ?: "")
     systemProperty("project.root", rootProject.rootDir.absolutePath)
+    // The evaluation loads whole recordings; a 45-minute WAV needs about 0.5 GB.
+    maxHeapSize = "2g"
 }
 
 dependencies {

@@ -2,7 +2,10 @@ package com.example.grandfatherclock.audio
 
 import kotlin.math.PI
 import kotlin.math.abs
+import kotlin.math.atan2
+import kotlin.math.ceil
 import kotlin.math.cos
+import kotlin.math.hypot
 import kotlin.math.ln
 import kotlin.math.roundToInt
 import kotlin.math.sin
@@ -27,7 +30,11 @@ import kotlin.math.sqrt
  * 5. Uncertainty: the beats wander around the line in a correlated way (the
  *    escape wheel's per-tooth pattern, slow drift over minutes), so the formal
  *    least-squares error is combined with a slow-wander term estimated from the
- *    smoothed residuals.
+ *    smoothed residuals, and with a prior for wander slower than the fit, which
+ *    includes the known clock's steady waves (see [ClockProfile.waves]).
+ * 6. Waves: a session of [WAVE_FIT_SECONDS] or more measures the known clock's
+ *    steady waves over all its beats and subtracts them from the beat times
+ *    before the fit, so they don't tilt the rate.
  */
 class TickDetector(
     private val sampleRate: Int = AudioCapture.SAMPLE_RATE,
@@ -593,8 +600,17 @@ class TickDetector(
         var from = beats.size
         while (from > 0 && beats[from - 1].sample >= windowStart) from--
         val recent = beats.subList(from, beats.size)
-        val f = fitBeats(recent.map { it.k }, recent.map { it.parity }, recent.map { it.sample }, profile,
-            toothConfirmed) ?: return
+        val sessionSpan = beats.last().sample - beats.first().sample
+        // One robust line through all beats, for the whole-session trace and the waves.
+        val sessionLine = if (sessionSpan > samplesFor(TRACE_SECONDS.toDouble())) {
+            robustLine(0, beats.size, model)
+        } else null
+        val waves = if (toothConfirmed && sessionSpan >= samplesFor(WAVE_FIT_SECONDS)) {
+            sessionLine?.let { fitWaves(profile, it) }
+        } else null
+        val times = if (waves == null) recent.map { it.sample } else recent.map { it.sample - waves.offset(it.sample) }
+        val f = fitBeats(recent.map { it.k }, recent.map { it.parity }, times, profile, toothConfirmed,
+            wavesRemoved = waves != null) ?: return
         if (f.recognised != null && !toothConfirmed) {
             toothConfirmed = true
             logger?.log("CLOCK", "recognised the %s: its %d-tooth escape-wheel pattern matches the beats"
@@ -612,13 +628,22 @@ class TickDetector(
             // A drifting rate has no single value to settle on.
             synced = secPerWeek <= SYNCED_SEC_PER_WEEK && recentHitRate() >= 0.8 && rateTrend == null
         }
-        val sessionSpan = beats.last().sample - beats.first().sample
-        sessionTrace = if (sessionSpan <= samplesFor(TRACE_SECONDS.toDouble())) trace else binnedSessionTrace()
+        sessionTrace = when {
+            sessionSpan <= samplesFor(TRACE_SECONDS.toDouble()) -> trace
+            sessionLine != null -> binnedSessionTrace(sessionLine)
+            else -> emptyList()
+        }
         if (beats.size % 20 == 0) {
             logger?.log("FIT", "period=%.1fµs ±%.1fµs imbalance=%.0f±%.0fµs rms=%.1fms beats=%d/%d window=±%.0fms clock=%s"
                 .format(periodMicros, uncertaintyMicros, imbalanceMicros, imbalanceUncertaintyMicros,
                     f.residualSigma * 1000 / sampleRate, beats.size, slotsExamined,
                     windowSamples * 1000 / sampleRate, f.recognised?.name ?: "not recognised"))
+            waves?.let { w ->
+                logger?.log("WAVES", profile.waves.indices.joinToString(" ") { i ->
+                    "%.2fmin %.1fms@%.0f°".format(profile.waves[i].periodSeconds / 60,
+                        w.amplitude(i) * 1000 / sampleRate, w.phaseDegrees(i))
+                } + " turns=${w.turns}")
+            }
         }
     }
 
@@ -705,8 +730,7 @@ class TickDetector(
      * starting at the first beat, so as the session grows existing bins only
      * merge in pairs and their averages stay put.
      */
-    private fun binnedSessionTrace(): List<TracePoint> {
-        val r = robustLine(0, beats.size, model) ?: return emptyList()
+    private fun binnedSessionTrace(r: LineResult): List<TracePoint> {
         val line = r.line
         val t0 = beats.first().sample
         val span = maxOf(1.0, beats.last().sample - t0)
@@ -798,9 +822,14 @@ class TickDetector(
         val spanSamples: Double,
     )
 
-    /** Beats must be in time order. Returns null until each beat type has at least two beats. */
+    /**
+     * Beats must be in time order. [wavesRemoved] says the profile's steady waves
+     * have been subtracted from [t]. Returns null until each beat type has at
+     * least two beats.
+     */
     private fun fitBeats(
         k: List<Int>, par: List<Int>, t: List<Double>, profile: ClockProfile, toothConfirmed: Boolean,
+        wavesRemoved: Boolean = false,
     ): Fit? {
         val n = t.size
         if (n < 5) return null
@@ -845,6 +874,7 @@ class TickDetector(
         var periodFormal = formal
         var periodResiduals = rr
         var wanderPriorSeconds = ClockProfile.UNKNOWN.wanderSeconds
+        var unknownWaves = emptyList<ClockProfile.Wave>()
         var recognised: ClockProfile? = null
         val teeth = profile.escapeWheelTeeth
         if (teeth > 0 && span >= MIN_TOOTH_TURNS * teeth * p) {
@@ -853,15 +883,23 @@ class TickDetector(
                 periodFormal = tf.formal
                 periodResiduals = tf.residuals
                 wanderPriorSeconds = profile.wanderSeconds
+                unknownWaves = (if (wavesRemoved) emptyList() else profile.waves) +
+                    listOfNotNull(profile.irregularWander)
                 recognised = profile
             }
         }
 
         // Wander slower than the span looks like a straight trend, so it hides in
-        // the slope and can't be seen in the residuals. A prior amplitude for such
-        // wander, taken from how real clocks behave, covers it.
+        // the slope and can't be seen in the residuals. A prior for such wander,
+        // taken from how real clocks behave, covers it: short-term wander as an
+        // offset across the span, and the clock's slow waves by how much a wave of
+        // unknown phase tilts a line fitted over the span. The larger of the two
+        // counts, because short-term wander was measured with the waves in it.
         val wander = slowWanderTerm(periodResiduals, span, period)
-        val wanderPrior = samplesFor(wanderPriorSeconds) / span * period
+        val wanderPrior = maxOf(
+            samplesFor(wanderPriorSeconds) / span * period,
+            waveSlopeError(unknownWaves, span / sampleRate) * period,
+        )
         val periodSigma = UNCERTAINTY_SCALE *
             sqrt(periodFormal * periodFormal + wander * wander + wanderPrior * wanderPrior)
 
@@ -916,6 +954,147 @@ class TickDetector(
             std(residuals) / sqrt(maxOf(1.0, m.toDouble() / w))
         }
         return sqrt(2.0) * slow / span * period
+    }
+
+    /**
+     * Typical error, as a fraction of the period, that waves of unknown phase add
+     * to the slope of a line fitted over [spanSeconds]: the rms over phase of
+     * each wave's least-squares slope, combined over the waves. A wave much
+     * longer than the span tilts the line by up to its full rate swing; one
+     * much shorter averages out.
+     */
+    private fun waveSlopeError(waves: List<ClockProfile.Wave>, spanSeconds: Double): Double {
+        var sum = 0.0
+        for (w in waves) {
+            // Least-squares slope of sin(2πt/P + φ) over the span, relative to its peak rate 2π/P.
+            val z = PI * spanSeconds / w.periodSeconds
+            val gain = if (z < 0.01) 1 - z * z / 10 else 3 * (sin(z) - z * cos(z)) / (z * z * z)
+            val rate = 2 * PI * w.amplitudeSeconds / w.periodSeconds * gain
+            sum += rate * rate / 2
+        }
+        return sqrt(sum)
+    }
+
+    /** The steady waves measured in a session, as cosine and sine coefficients in samples. */
+    private class WaveFit(private val periods: DoubleArray, private val coefficients: DoubleArray, val turns: Int) {
+        /** How much the waves delay a beat at this sample. */
+        fun offset(sample: Double): Double {
+            var s = 0.0
+            for (i in periods.indices) {
+                val ph = 2 * PI * sample / periods[i]
+                s += coefficients[2 * i] * cos(ph) + coefficients[2 * i + 1] * sin(ph)
+            }
+            return s
+        }
+        fun amplitude(i: Int) = hypot(coefficients[2 * i], coefficients[2 * i + 1])
+        /** Phase of the wave's latest beats, from the start of the session. */
+        fun phaseDegrees(i: Int) = (Math.toDegrees(atan2(coefficients[2 * i + 1], coefficients[2 * i])) + 360) % 360
+    }
+
+    /**
+     * Measures the profile's steady waves over the whole session. The offsets
+     * of the beats from [line] are averaged over each turn of the escape wheel,
+     * which cancels the per-tooth pattern, and the turn averages are fitted with
+     * a smooth curve for the drift of the rate (a cubic spline with knots every
+     * [WAVE_TREND_KNOT_SECONDS]) plus a cosine and sine at each wave's period, by
+     * least squares that leaves out turns beyond five robust standard deviations.
+     */
+    private fun fitWaves(profile: ClockProfile, line: LineResult): WaveFit? {
+        val teeth = profile.escapeWheelTeeth
+        if (profile.waves.isEmpty() || teeth <= 0) return null
+        val turnT = ArrayList<Double>(); val turnR = ArrayList<Double>()
+        var i = 0
+        while (i < beats.size) {
+            val turn = Math.floorDiv(beats[i].k, teeth)
+            var j = i; var n = 0; var st = 0.0; var sr = 0.0
+            while (j < beats.size && Math.floorDiv(beats[j].k, teeth) == turn) {
+                if (line.inlier[j]) {
+                    val b = beats[j]
+                    st += b.sample; sr += b.sample - (line.line[b.parity] + b.k * line.line[2]); n++
+                }
+                j++
+            }
+            // The pattern cancels only when most of the turn's beats were heard.
+            if (n >= TURN_MIN_SHARE * 2 * teeth) { turnT += st / n; turnR += sr / n }
+            i = j
+        }
+        val m = turnT.size
+        if (m < 2) return null
+        val x0 = turnT[0]
+        val step = samplesFor(WAVE_TREND_KNOT_SECONDS)
+        val splines = ceil((turnT[m - 1] - x0) / step).toInt() + 3
+        val waveCount = profile.waves.size
+        val cols = splines + 2 * waveCount
+        if (m < 4 * cols) return null
+        val periods = DoubleArray(waveCount) { samplesFor(profile.waves[it].periodSeconds) }
+        val row = Array(m) { r ->
+            val a = DoubleArray(cols)
+            // Uniform cubic B-splines: basis j spans knots j-3 .. j+1.
+            val u = (turnT[r] - x0) / step
+            for (j in 0 until splines) {
+                val v = u - j + 3
+                a[j] = when {
+                    v < 0 || v >= 4 -> 0.0
+                    v < 1 -> v * v * v / 6
+                    v < 2 -> { val w = v - 1; (((-3 * w + 3) * w + 3) * w + 1) / 6 }
+                    v < 3 -> { val w = v - 2; ((3 * w - 6) * w * w + 4) / 6 }
+                    else -> { val w = 4 - v; w * w * w / 6 }
+                }
+            }
+            for (q in 0 until waveCount) {
+                val ph = 2 * PI * turnT[r] / periods[q]
+                a[splines + 2 * q] = cos(ph); a[splines + 2 * q + 1] = sin(ph)
+            }
+            a
+        }
+        val use = BooleanArray(m) { true }
+        var sol: DoubleArray? = null
+        repeat(3) {
+            val ata = Array(cols) { DoubleArray(cols) }; val atb = DoubleArray(cols)
+            for (r in 0 until m) if (use[r]) {
+                val a = row[r]
+                for (p in 0 until cols) {
+                    if (a[p] == 0.0) continue
+                    atb[p] += a[p] * turnR[r]
+                    for (q in p until cols) ata[p][q] += a[p] * a[q]
+                }
+            }
+            for (p in 0 until cols) for (q in 0 until p) ata[p][q] = ata[q][p]
+            val x = solve(ata, atb) ?: return null
+            val res = DoubleArray(m) { r -> turnR[r] - row[r].indices.sumOf { row[r][it] * x[it] } }
+            val rIn = res.filterIndexed { r, _ -> use[r] }
+            val med = median(rIn)
+            val cutoff = maxOf(5 * 1.4826 * median(rIn.map { abs(it - med) }), samplesFor(0.001))
+            for (r in 0 until m) use[r] = abs(res[r]) <= cutoff
+            sol = x
+        }
+        val x = sol ?: return null
+        return WaveFit(periods, x.copyOfRange(splines, cols), use.count { it })
+    }
+
+    /** Solves a·x = b by Gaussian elimination with partial pivoting; null when a is singular. */
+    private fun solve(a: Array<DoubleArray>, b: DoubleArray): DoubleArray? {
+        val n = b.size
+        val m = Array(n) { a[it].copyOf() }; val y = b.copyOf()
+        for (c in 0 until n) {
+            var p = c
+            for (r in c + 1 until n) if (abs(m[r][c]) > abs(m[p][c])) p = r
+            if (abs(m[p][c]) < 1e-12) return null
+            m[c] = m[p].also { m[p] = m[c] }; y[c] = y[p].also { y[p] = y[c] }
+            for (r in c + 1 until n) {
+                val f = m[r][c] / m[c][c]
+                if (f == 0.0) continue
+                for (q in c until n) m[r][q] -= f * m[c][q]
+                y[r] -= f * y[c]
+            }
+        }
+        val x = DoubleArray(n)
+        for (r in n - 1 downTo 0) {
+            var s = y[r]
+            for (q in r + 1 until n) s -= m[r][q] * x[q]
+            x[r] = s / m[r][r]
+        }
+        return x
     }
 
     private class ToothFit(
@@ -1104,6 +1283,13 @@ class TickDetector(
         const val TRACE_SECONDS = 600f
         /** The published rate, uncertainty and imbalance describe the last this many seconds. */
         const val RESULT_WINDOW_SECONDS = 1800.0
+        /**
+         * Sessions at least this long measure the known clock's steady waves and
+         * subtract them. Medusa's waves of 60 and 48.75 minutes drift in and out of
+         * step every 4.4 hours, so they can be told apart only after a good part
+         * of that; on its overnight recording three hours sufficed.
+         */
+        const val WAVE_FIT_SECONDS = 3 * 3600.0
         /** Most time bins per beat type in the whole-session trace of a long session. */
         const val SESSION_TRACE_BINS = 300
         /** Narrowest bin of the whole-session trace; wider bins double it. */
@@ -1118,6 +1304,13 @@ class TickDetector(
          * within this span.
          */
         private const val TRACK_BEATS = 400
+        /**
+         * Knot spacing of the spline that follows the rate's drift beneath the
+         * waves: too stiff to bend with waves of an hour or less.
+         */
+        private const val WAVE_TREND_KNOT_SECONDS = 7200.0
+        /** Share of an escape-wheel turn's beats that must be heard for its average to count in the wave fit. */
+        private const val TURN_MIN_SHARE = 0.75
         /** Sessions shorter than this don't get a rate trend; the clock's wander would dominate. */
         private const val TREND_MIN_SECONDS = 3600.0
         /** Length of the blocks whose rates the trend is fitted to. */
