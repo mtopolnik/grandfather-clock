@@ -26,3 +26,6 @@ local.properties
 
 # Claude Code
 .claude/
+
+# Facts about the owner's clocks, kept locally (imported by CLAUDE.md)
+docs/clocks.md

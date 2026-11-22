@@ -74,9 +74,13 @@ Single-activity, single-screen app with three layers:
 
 ## Measurement limits
 
-The clocks' own timing irregularity, not the DSP, limits accuracy. Both clocks repeat a ±10–14 ms per-tooth pattern once per escape-wheel turn (30 periods for Nattich, 26 for Medusa) and wander slowly over minutes, by about ±3 ms (Nattich) and ±6–7 ms (Medusa). Typical live errors at 15 s / 1 min / 2 min / 4 min: Nattich ≈ 1000 / 60 / 40 / 18 µs, Medusa ≈ 450 / 90 / 58 / 35 µs (1 µs ≈ 0.4 s/week). Wander slower than the listening window can't be seen from inside it, so the uncertainty includes a prior wander amplitude (`WANDER_PRIOR_SECONDS`).
+The clocks' own timing irregularity, not the DSP, limits accuracy. Both clocks repeat a ±10–14 ms per-tooth pattern once per escape-wheel turn (30 periods for Nattich, 26 for Medusa) and wander slowly over minutes, by about ±3 ms (Nattich) and ±6–7 ms (Medusa) within 15-minute recordings; over hours Medusa wanders by 20–30 ms rms (see `docs/clocks.md`). Typical live errors at 15 s / 1 min / 2 min / 4 min: Nattich ≈ 1000 / 60 / 40 / 18 µs, Medusa ≈ 450 / 90 / 58 / 35 µs (1 µs ≈ 0.4 s/week). Wander slower than the listening window can't be seen from inside it, so the uncertainty includes a prior wander amplitude (`WANDER_PRIOR_SECONDS`).
 
-Medusa (spring-driven) changes rate with its state of wind: its period rose by about 480 µs (about 250 s/week slower) between 1 h and 22 h after winding, and according to its owner it speeds up to about +5 min/week late in a second week without winding. Nattich is weight-driven. Both clocks strike, which disturbs the rate for a few minutes, and are wound together (log: `~/Desktop/grandfather-clock/winding.txt`). Overnight (9.8 h, Medusa), the timing after removing the slow drift wandered by 20–30 ms rms: hour-locked components at 1/h (16 ms), 8/h (the 7.5-minute wave, 5 ms) and 2/h (4 ms), the rest irregular with periods of 25–100 minutes. Subtracting an hour-locked model learned on other hours cut 2–4 minute rate errors by about 25% but barely helped 10–20 minute ones; whether the pattern holds across days is still open.
+## The two clocks
+
+What is known about Nattich and Medusa (drive, pendulum, strikes, measured rates, dependence on winding, wander) is kept in `docs/clocks.md`. Add to it when new facts come in, from the owner or from recordings.
+
+@docs/clocks.md
 
 ## UI
 
