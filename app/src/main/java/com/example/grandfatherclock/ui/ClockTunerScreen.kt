@@ -24,7 +24,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.History
@@ -55,6 +54,7 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipRect
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
@@ -139,11 +139,10 @@ fun ClockTunerScreen(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center,
         ) {
-            // Flashing circle
-            // The circle names a known clock once its beat rate is measured, and
+            // The beat light names a known clock once its beat rate is measured, and
             // shows the beats per minute for any other clock.
             val bpm = if (state.periodMicros > 0) SessionStore.classifyBpm(state.periodMicros) else null
-            FlashingCircle(
+            BeatLight(
                 lastBeatIsTick = state.lastBeatIsTick,
                 flashTrigger = state.flashTrigger,
                 synced = state.synced,
@@ -155,9 +154,6 @@ fun ClockTunerScreen(
             // Period (shown once available); after stop it is the session's result.
             if (state.periodMicros > 0) {
                 PeriodDisplay(
-                    // Past the result window the number describes only its latest part.
-                    label = (if (state.running) "Live" else "Final") +
-                        if (state.elapsedSeconds > TickDetector.RESULT_WINDOW_SECONDS) ", last 30 min" else "",
                     periodMicros = state.periodMicros,
                     uncertaintyMicros = state.uncertaintyMicros,
                     synced = state.synced,
@@ -190,15 +186,6 @@ fun ClockTunerScreen(
                     text = "Beat imbalance: ${formatMillis(ms, unc)} \u00B1 ${formatMillis(unc, unc)} ms",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f),
-                )
-            }
-
-            state.recognisedClock?.let { clock ->
-                Spacer(modifier = Modifier.height(6.dp))
-                Text(
-                    text = "Recognised: ${clock.name} (${clock.escapeWheelTeeth}-tooth escape wheel)",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.5f),
                 )
             }
 
@@ -359,7 +346,6 @@ fun ClockTunerScreen(
 
 @Composable
 private fun PeriodDisplay(
-    label: String,
     periodMicros: Double,
     uncertaintyMicros: Double,
     synced: Boolean,
@@ -372,14 +358,6 @@ private fun PeriodDisplay(
     val sign = if (secPerWeek >= 0) "+" else ""
     val devFmt = String.format(Locale.US, "%.1f", secPerWeek)
     val uncFmt = String.format(Locale.US, "%.1f", uncSecPerWeek)
-
-    Text(
-        text = label,
-        style = MaterialTheme.typography.labelMedium,
-        color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.5f),
-    )
-
-    Spacer(modifier = Modifier.height(4.dp))
 
     Text(
         text = "${sign}${devFmt}\u2009s/week",
@@ -399,7 +377,7 @@ private fun PeriodDisplay(
 }
 
 @Composable
-private fun FlashingCircle(
+private fun BeatLight(
     lastBeatIsTick: Boolean?,
     flashTrigger: Int,
     synced: Boolean,
@@ -418,20 +396,22 @@ private fun FlashingCircle(
     val animatedColor by animateColorAsState(
         targetValue = flashColor,
         animationSpec = tween(durationMillis = 100),
-        label = "circleColor",
+        label = "beatLightColor",
     )
 
+    // A wide, short pill, which takes little height above the readings.
+    val shape = RoundedCornerShape(percent = 50)
     val borderModifier = if (synced) {
-        Modifier.border(3.dp, SyncGreen, CircleShape)
+        Modifier.border(3.dp, SyncGreen, shape)
     } else {
-        Modifier.border(1.dp, IdleGray.copy(alpha = 0.3f), CircleShape)
+        Modifier.border(1.dp, IdleGray.copy(alpha = 0.3f), shape)
     }
 
     Box(
         modifier = Modifier
-            .size(100.dp)
+            .size(width = 200.dp, height = 64.dp)
             .then(borderModifier)
-            .clip(CircleShape)
+            .clip(shape)
             .background(animatedColor),
         contentAlignment = Alignment.Center,
     ) {
@@ -439,9 +419,12 @@ private fun FlashingCircle(
             Text(
                 text = label,
                 // A beat rate is a few digits; a clock's name needs a smaller size to fit.
-                fontSize = if (label.length <= 3) 32.sp else 18.sp,
+                fontSize = if (label.length <= 3) 44.sp else 28.sp,
                 fontWeight = FontWeight.Bold,
-                color = MaterialTheme.colorScheme.onBackground,
+                maxLines = 1,
+                softWrap = false,
+                // Teal and orange are light, so the label turns dark as the light comes on.
+                color = lerp(MaterialTheme.colorScheme.onBackground, Color.Black, animatedColor.alpha),
             )
         }
     }
