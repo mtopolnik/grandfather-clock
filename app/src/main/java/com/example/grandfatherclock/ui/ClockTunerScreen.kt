@@ -52,14 +52,18 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
@@ -74,6 +78,7 @@ import com.example.grandfatherclock.ui.theme.SyncGreen
 import com.example.grandfatherclock.ui.theme.Teal
 import kotlinx.coroutines.delay
 import java.util.Locale
+import java.util.TimeZone
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
@@ -208,6 +213,7 @@ fun ClockTunerScreen(
                 TimingTrace(
                     trace = shownTrace,
                     elapsedSeconds = state.elapsedSeconds,
+                    startTimeMillis = state.startTimeMillis,
                     fromSeconds = if (showAll) 0f else state.elapsedSeconds.toFloat() - TickDetector.TRACE_SECONDS,
                     // A whole session can drift by hundreds of milliseconds.
                     maxSpanMillis = if (showAll) 5000f else 100f,
@@ -219,6 +225,7 @@ fun ClockTunerScreen(
                 Spacer(modifier = Modifier.height(12.dp))
                 ProgressChart(
                     history = state.history,
+                    startTimeMillis = state.startTimeMillis,
                     fromSeconds = if (showAll) 0f else state.elapsedSeconds.toFloat() - TickDetector.TRACE_SECONDS,
                     spanLabel = spanLabel,
                     modifier = Modifier.fillMaxWidth().height(110.dp).then(toggle),
@@ -627,6 +634,7 @@ private fun ChartLabel(left: String, right: String) = ChartLabel(AnnotatedString
 private fun TimingTrace(
     trace: List<TickDetector.TracePoint>,
     elapsedSeconds: Double,
+    startTimeMillis: Long,
     /** Start of the time span shown, in seconds since the start of the session. */
     fromSeconds: Float,
     /** Largest vertical scale, in milliseconds either side. */
@@ -653,6 +661,7 @@ private fun TimingTrace(
             val mid = size.height / 2
             val r = 1.8.dp.toPx()
             drawLine(axis, Offset(0f, mid), Offset(size.width, mid), strokeWidth = 1.dp.toPx())
+            drawHourMarks(hourMarks(startTimeMillis, tMin, tMax), tMin, tMax, axis)
             for (p in trace) {
                 val x = (p.timeSeconds - tMin) / (tMax - tMin) * size.width
                 val y = mid - p.residualMillis.coerceIn(-span, span) / span * (mid - r)
@@ -675,6 +684,7 @@ private fun TimingTrace(
 @Composable
 private fun ProgressChart(
     history: List<MainViewModel.HistoryPoint>,
+    startTimeMillis: Long,
     /** Start of the time span shown, in seconds since the start of the session. */
     fromSeconds: Float,
     spanLabel: String,
@@ -688,6 +698,9 @@ private fun ProgressChart(
     val range = maxOf(3 * spread(last.uncertaintyMicros), 15.0)
     val lineColor = MaterialTheme.colorScheme.primary
     val axis = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.3f)
+    val markColor = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.2f)
+    val labelStyle = TextStyle(fontSize = 9.sp, color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.5f))
+    val measurer = rememberTextMeasurer()
     Column(modifier = modifier) {
         ChartLabel("Rate over time$spanLabel", "${signed(center - range)} … ${signed(center + range)} s/week")
         Canvas(modifier = Modifier.fillMaxWidth().weight(1f)) {
@@ -701,6 +714,8 @@ private fun ProgressChart(
             // estimates within float range; it moves edge crossings by under a pixel.
             fun y(v: Double) = (size.height / 2 - (v - center) / range * size.height / 2)
                 .coerceIn(-1e6, 1e6).toFloat()
+            val marks = hourMarks(startTimeMillis, tMin, tMax)
+            drawHourMarks(marks, tMin, tMax, markColor)
             clipRect {
                 val band = Path().apply {
                     history.forEachIndexed { i, h ->
@@ -730,11 +745,66 @@ private fun ProgressChart(
                 }
                 drawPath(line, lineColor, style = Stroke(width = 2.dp.toPx()))
             }
+            // Clock times at the foot of the marks, as many as fit without crowding:
+            // every mark, the full hours, or every few full hours.
+            val sample = measurer.measure("00:00", labelStyle).size
+            val halfHourPx = HALF_HOUR_SECONDS / (tMax - tMin) * size.width
+            val every = generateSequence(1L) { it * 2 }.take(12)
+                .firstOrNull { it * halfHourPx >= sample.width + 6.dp.toPx() }
+            if (every != null) for (m in marks) {
+                if ((m.localMinutes / 30) % every != 0L) continue
+                val px = x(m.seconds) + 2.dp.toPx()
+                if (px + sample.width > size.width) continue
+                val text = String.format(Locale.US, "%02d:%02d", m.localMinutes / 60 % 24, m.localMinutes % 60)
+                drawText(measurer, text, Offset(px, size.height - sample.height), labelStyle)
+            }
         }
     }
 }
 
 private fun signed(v: Double): String = String.format(Locale.US, "%+.0f", v)
+
+private const val HALF_HOUR_SECONDS = 1800f
+private const val HALF_HOUR_MILLIS = 1_800_000L
+
+/**
+ * A full or half hour of local clock time: [seconds] into the session, and
+ * [localMinutes] since local midnight of 1 January 1970, a multiple of 30.
+ */
+private class HourMark(val seconds: Float, val localMinutes: Long) {
+    val fullHour: Boolean get() = localMinutes % 60 == 0L
+}
+
+/**
+ * The full and half hours of the phone's local time from [tMin] to [tMax]
+ * seconds into a session that started at [startMillis]; none before a session.
+ */
+private fun hourMarks(startMillis: Long, tMin: Float, tMax: Float): List<HourMark> {
+    if (startMillis <= 0L) return emptyList()
+    val from = startMillis + (tMin * 1000).toLong()
+    val to = startMillis + (tMax * 1000).toLong()
+    val offset = TimeZone.getDefault().getOffset(from)
+    var local = Math.floorDiv(from + offset + HALF_HOUR_MILLIS - 1, HALF_HOUR_MILLIS) * HALF_HOUR_MILLIS
+    val marks = mutableListOf<HourMark>()
+    while (local - offset <= to) {
+        marks += HourMark((local - offset - startMillis) / 1000f, local / 60_000)
+        local += HALF_HOUR_MILLIS
+    }
+    return marks
+}
+
+/** Vertical lines across the chart: solid at full hours, dashed at half hours. */
+private fun DrawScope.drawHourMarks(marks: List<HourMark>, tMin: Float, tMax: Float, color: Color) {
+    for (m in marks) {
+        val px = (m.seconds - tMin) / (tMax - tMin) * size.width
+        drawLine(
+            color, Offset(px, 0f), Offset(px, size.height),
+            strokeWidth = 1.dp.toPx(),
+            pathEffect = if (m.fullHour) null
+            else PathEffect.dashPathEffect(floatArrayOf(3.dp.toPx(), 3.dp.toPx())),
+        )
+    }
+}
 
 /** Formats milliseconds with one decimal when the uncertainty is below a millisecond. */
 private fun formatMillis(value: Double, uncertainty: Double): String =

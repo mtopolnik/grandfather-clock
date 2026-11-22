@@ -68,6 +68,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val lastBeatIsTick: Boolean? = null,
         val flashTrigger: Int = 0,
         val elapsedSeconds: Double = 0.0,
+        /** When the session started (wall clock, ms since the epoch), for marking clock times on the charts. */
+        val startTimeMillis: Long = 0L,
         val synced: Boolean = false,
         /** Tick-to-tock minus ideal half-period, in µs. */
         val imbalanceMicros: Double = 0.0,
@@ -133,7 +135,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         beatLog = if (dir != null) runCatching { BeatLog(dir) }.getOrNull() else null
         tickDetector.onBeat = beatLog?.let { log -> { beat -> log.write(beat) } }
 
-        _state.value = UiState(running = true, logPath = sessionLogger?.filePath)
+        _state.value = UiState(
+            running = true, logPath = sessionLogger?.filePath, startTimeMillis = sessionStartTimeMillis)
 
         audioCapture = AudioCapture(
             onBuffer = { buffer, count ->
