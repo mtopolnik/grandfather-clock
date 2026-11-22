@@ -77,8 +77,17 @@ class TickDetector(
         val beatsExpected: Int = 0,
         /** Fraction of the most recent beat slots in which a beat was heard. */
         val recentHitRate: Double = 0.0,
-        /** Beats of the last [TRACE_SECONDS], with their offsets from the fitted line. */
+        /**
+         * Beats of the last [TRACE_SECONDS], each with its offset from the line
+         * that predicted it, recorded when it was heard and never changed.
+         */
         val trace: List<TracePoint> = emptyList(),
+        /**
+         * The whole session: offsets from one line through all beats, so a drift
+         * over hours shows. Sessions longer than [TRACE_SECONDS] are averaged into
+         * [SESSION_TRACE_BINS] time bins per beat type.
+         */
+        val sessionTrace: List<TracePoint> = emptyList(),
         /** The known clock whose escape-wheel pattern the beats confirmed, or null. */
         val recognisedClock: ClockProfile? = null,
         /** A significant change of rate during the session, or null. */
@@ -156,8 +165,12 @@ class TickDetector(
     private var imbalanceMicros = 0.0
     private var imbalanceUncertaintyMicros = 0.0
     private var trace: List<TracePoint> = emptyList()
+    private val recentTrace = ArrayDeque<TracePoint>()
+    /** Robust scatter of recent beats around the prediction line, in samples. */
+    private var trackSigma = 0.0
     private var recognisedClock: ClockProfile? = null
     private var rateTrend: RateTrend? = null
+    private var sessionTrace: List<TracePoint> = emptyList()
     /** The recognised clock's tooth count has been confirmed by this session's beats. */
     private var toothConfirmed = false
     private var synced = false
@@ -243,6 +256,7 @@ class TickDetector(
         beatsExpected = slotsExamined,
         recentHitRate = recentHitRate(),
         trace = trace,
+        sessionTrace = sessionTrace,
         recognisedClock = recognisedClock,
         rateTrend = rateTrend,
     )
@@ -289,6 +303,9 @@ class TickDetector(
         periodMicros = 0.0; uncertaintyMicros = 0.0
         imbalanceMicros = 0.0; imbalanceUncertaintyMicros = 0.0
         trace = emptyList()
+        recentTrace.clear()
+        trackSigma = 0.0
+        sessionTrace = emptyList()
         recognisedClock = null
         toothConfirmed = false
         rateTrend = null
@@ -521,6 +538,7 @@ class TickDetector(
             recentResiduals[parity][recentResidualCount[parity] % recentResiduals[parity].size] = onset - linePred
             recentResidualCount[parity]++
             updateTrackingModel()
+            addToTrace(beat, onset - linePred)
             // Each refit costs time in proportion to the beats so far and runs on
             // the audio thread. Refitting every (beats / FULL_REFIT_BEATS)-th beat
             // keeps the average cost per beat bounded in sessions lasting hours.
@@ -589,22 +607,8 @@ class TickDetector(
             // A drifting rate has no single value to settle on.
             synced = secPerWeek <= SYNCED_SEC_PER_WEEK && recentHitRate() >= 0.8 && rateTrend == null
         }
-        // The trace shows each beat's offset from a line fitted to the beats it
-        // spans, so it stays centred when the clock's rate drifts over hours.
-        val traceStart = totalSamples - samplesFor(TRACE_SECONDS.toDouble())
-        var first = beats.size
-        while (first > 0 && beats[first - 1].sample >= traceStart) first--
-        val traceLine = robustLine(first, beats.size, model)
-        trace = if (traceLine == null) emptyList() else (first until beats.size).map { i ->
-            val b = beats[i]
-            val line = traceLine.line
-            TracePoint(
-                timeSeconds = (b.sample / sampleRate).toFloat(),
-                residualMillis = ((b.sample - (line[b.parity] + b.k * line[2])) * 1000 / sampleRate).toFloat(),
-                isTick = b.parity == 0,
-                inlier = traceLine.inlier[i - first],
-            )
-        }
+        val sessionSpan = beats.last().sample - beats.first().sample
+        sessionTrace = if (sessionSpan <= samplesFor(TRACE_SECONDS.toDouble())) trace else binnedSessionTrace()
         if (beats.size % 20 == 0) {
             logger?.log("FIT", "period=%.1fµs ±%.1fµs imbalance=%.0f±%.0fµs rms=%.1fms beats=%d/%d window=±%.0fms clock=%s"
                 .format(periodMicros, uncertaintyMicros, imbalanceMicros, imbalanceUncertaintyMicros,
@@ -623,6 +627,7 @@ class TickDetector(
         if (beats.size - from < 8) return
         val r = robustLine(from, beats.size, model) ?: return
         r.line.copyInto(model)
+        trackSigma = r.sigma
         if (beats.size - from >= 16) {
             windowSamples = (4 * r.sigma).coerceIn(minWindowSamples, maxWindowSamples)
         }
@@ -670,6 +675,59 @@ class TickDetector(
         if (abs(slope) <= TREND_SIGMAS * se || changeSecPerWeek < SYNCED_SEC_PER_WEEK) return null
         val toMicros = 1e6 / sampleRate
         return RateTrend(start * toMicros, end * toMicros, (centres.last() - centres.first()) / sampleRate)
+    }
+
+    /**
+     * Adds a beat to the recent trace with its offset from the line that
+     * predicted it. The offset is fixed from then on, so the trace only scrolls
+     * as beats arrive; beats beyond the stated scatter are marked as outliers.
+     */
+    private fun addToTrace(beat: Beat, residual: Double) {
+        recentTrace.addLast(TracePoint(
+            timeSeconds = (beat.sample / sampleRate).toFloat(),
+            residualMillis = (residual * 1000 / sampleRate).toFloat(),
+            isTick = beat.parity == 0,
+            inlier = beats.size < 16 || abs(residual) <= maxOf(5 * trackSigma, samplesFor(0.002)),
+        ))
+        val oldest = (beat.sample / sampleRate - TRACE_SECONDS).toFloat()
+        while (recentTrace.isNotEmpty() && recentTrace.first().timeSeconds < oldest) recentTrace.removeFirst()
+        trace = recentTrace.toList()
+    }
+
+    /**
+     * Offsets from one robust line through all beats, averaged per time bin and
+     * beat type. Bins are [SESSION_BIN_SECONDS] times a power of two wide,
+     * starting at the first beat, so as the session grows existing bins only
+     * merge in pairs and their averages stay put.
+     */
+    private fun binnedSessionTrace(): List<TracePoint> {
+        val r = robustLine(0, beats.size, model) ?: return emptyList()
+        val line = r.line
+        val t0 = beats.first().sample
+        val span = maxOf(1.0, beats.last().sample - t0)
+        var width = samplesFor(SESSION_BIN_SECONDS)
+        while (span / width > SESSION_TRACE_BINS) width *= 2
+        val bins = (span / width).toInt() + 1
+        val sum = Array(2) { DoubleArray(bins) }
+        val tSum = Array(2) { DoubleArray(bins) }
+        val cnt = Array(2) { IntArray(bins) }
+        for (i in beats.indices) if (r.inlier[i]) {
+            val b = beats[i]
+            val j = ((b.sample - t0) / width).toInt().coerceAtMost(bins - 1)
+            sum[b.parity][j] += b.sample - (line[b.parity] + b.k * line[2])
+            tSum[b.parity][j] += b.sample
+            cnt[b.parity][j]++
+        }
+        val out = ArrayList<TracePoint>(2 * bins)
+        for (j in 0 until bins) for (p in 0..1) if (cnt[p][j] > 0) {
+            out += TracePoint(
+                timeSeconds = (tSum[p][j] / cnt[p][j] / sampleRate).toFloat(),
+                residualMillis = (sum[p][j] / cnt[p][j] * 1000 / sampleRate).toFloat(),
+                isTick = p == 0,
+                inlier = true,
+            )
+        }
+        return out
     }
 
     private class LineResult(val line: DoubleArray, val sigma: Double, val inlier: BooleanArray)
@@ -1039,6 +1097,10 @@ class TickDetector(
         const val SYNCED_SEC_PER_WEEK = 10.0
         /** Span of the timing trace, in seconds; longer sessions show only their latest part. */
         const val TRACE_SECONDS = 600f
+        /** Most time bins per beat type in the whole-session trace of a long session. */
+        const val SESSION_TRACE_BINS = 300
+        /** Narrowest bin of the whole-session trace; wider bins double it. */
+        private const val SESSION_BIN_SECONDS = 2.0
         /** Beats up to which every new beat triggers a refit; beyond it refits are spaced out. */
         private const val FULL_REFIT_BEATS = 2000
         /**

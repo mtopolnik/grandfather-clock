@@ -56,6 +56,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val listening: Boolean = true,
         /** Each beat's offset from the fitted line, for the timing trace. */
         val trace: List<TickDetector.TracePoint> = emptyList(),
+        /** The whole session's timing, for the timing trace's whole-session view. */
+        val sessionTrace: List<TickDetector.TracePoint> = emptyList(),
         /** The live estimate once per second, for the progress chart. */
         val history: List<HistoryPoint> = emptyList(),
         /** The known clock the beats were matched to, or null. */
@@ -164,6 +166,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     recentHitRate = s.recentHitRate,
                     listening = s.listening,
                     trace = s.trace,
+                    sessionTrace = s.sessionTrace,
                     history = history,
                     recognisedClock = s.recognisedClock,
                     rateTrend = s.rateTrend?.let {

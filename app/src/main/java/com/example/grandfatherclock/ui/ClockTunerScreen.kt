@@ -8,6 +8,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -43,6 +44,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -113,6 +115,7 @@ fun ClockTunerScreen(
     onRequestSilenceAccess: () -> Unit = {},
 ) {
     val state by viewModel.state.collectAsState()
+    var wholeSession by rememberSaveable { mutableStateOf(false) }
     val recordingMinutes by viewModel.recordingMinutes.collectAsState()
     val isUpsideDown = rememberIsUpsideDown()
 
@@ -197,19 +200,39 @@ fun ClockTunerScreen(
                 )
             }
 
-            if (state.trace.isNotEmpty()) {
+            // A tap on either chart switches both between the last 10 minutes and
+            // the whole session; they differ only in sessions longer than that.
+            val longSession = state.elapsedSeconds > TickDetector.TRACE_SECONDS
+            val showAll = wholeSession || !longSession
+            val spanLabel = when {
+                !longSession -> ""
+                wholeSession -> " (whole session)"
+                else -> " (last ${(TickDetector.TRACE_SECONDS / 60).roundToInt()} min)"
+            }
+            val toggle = Modifier.clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+            ) { wholeSession = !wholeSession }
+            val shownTrace = if (showAll) state.sessionTrace else state.trace
+            if (shownTrace.isNotEmpty()) {
                 Spacer(modifier = Modifier.height(16.dp))
                 TimingTrace(
-                    trace = state.trace,
+                    trace = shownTrace,
                     elapsedSeconds = state.elapsedSeconds,
-                    modifier = Modifier.fillMaxWidth().height(110.dp),
+                    fromSeconds = if (showAll) 0f else state.elapsedSeconds.toFloat() - TickDetector.TRACE_SECONDS,
+                    // A whole session can drift by hundreds of milliseconds.
+                    maxSpanMillis = if (showAll) 5000f else 100f,
+                    spanLabel = spanLabel,
+                    modifier = Modifier.fillMaxWidth().height(110.dp).then(toggle),
                 )
             }
             if (state.history.size >= 2) {
                 Spacer(modifier = Modifier.height(12.dp))
                 ProgressChart(
                     history = state.history,
-                    modifier = Modifier.fillMaxWidth().height(110.dp),
+                    fromSeconds = if (showAll) 0f else state.elapsedSeconds.toFloat() - TickDetector.TRACE_SECONDS,
+                    spanLabel = spanLabel,
+                    modifier = Modifier.fillMaxWidth().height(110.dp).then(toggle),
                 )
             }
 
@@ -501,6 +524,10 @@ private fun formatDuration(minutes: Int): String = when {
     else -> String.format(Locale.US, "%.1f h", minutes / 60.0)
 }
 
+/** Vertical scales of the timing trace, in milliseconds either side of the line. */
+private val TRACE_SCALE_STEPS_MS =
+    listOf(10f, 20f, 30f, 50f, 75f, 100f, 150f, 200f, 300f, 500f, 750f, 1000f, 1500f, 2000f, 3000f, 5000f)
+
 /** Seconds of listening after which a missing rhythm is reported as a problem. */
 private const val LOCK_PATIENCE_SECONDS = 15.0
 /** Below this share of recent beats heard, the clock counts as hard to hear. */
@@ -605,18 +632,27 @@ private fun ChartLabel(left: String, right: String) = ChartLabel(AnnotatedString
 
 /**
  * Timegrapher-style trace: one dot per beat, placed by how early or late it came
- * relative to the fitted straight line. Two tidy bands (tick and tock) mean the
- * app is hearing the clock well; a scattered cloud means it isn't. A slow wave in
- * the bands is the clock's own escape-wheel pattern and is normal.
+ * relative to the line that predicted it (recent view), or to one line through
+ * the whole session (whole-session view, binned in long sessions). Two tidy
+ * bands (tick and tock) mean the app is hearing the clock well; a scattered
+ * cloud means it isn't. A repeating wave in the bands is the clock's own
+ * escape-wheel pattern and is normal.
  */
 @Composable
 private fun TimingTrace(
     trace: List<TickDetector.TracePoint>,
     elapsedSeconds: Double,
+    /** Start of the time span shown, in seconds since the start of the session. */
+    fromSeconds: Float,
+    /** Largest vertical scale, in milliseconds either side. */
+    maxSpanMillis: Float,
+    spanLabel: String,
     modifier: Modifier = Modifier,
 ) {
-    val spread = trace.filter { it.inlier }.maxOfOrNull { abs(it.residualMillis) } ?: 10f
-    val span = (spread * 1.2f).coerceIn(10f, 100f)
+    // The scale moves in steps, so the dots don't all rescale with every new extreme.
+    val spread = trace.filter { it.inlier }.maxOfOrNull { abs(it.residualMillis) } ?: 0f
+    val span = TRACE_SCALE_STEPS_MS.firstOrNull { it >= 1.1f * spread && it <= maxSpanMillis }
+        ?: maxSpanMillis
     val axis = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.2f)
     Column(modifier = modifier) {
         val legend = buildAnnotatedString {
@@ -626,10 +662,8 @@ private fun TimingTrace(
             withStyle(SpanStyle(color = Orange)) { append("tock") }
         }
         val tMax = maxOf(elapsedSeconds.toFloat(), trace.last().timeSeconds, 10f)
-        // A long session shows only its latest part, the span the trace covers.
-        val tMin = maxOf(0f, tMax - TickDetector.TRACE_SECONDS)
-        val recent = if (tMin > 0f) " (last ${(TickDetector.TRACE_SECONDS / 60).roundToInt()} min)" else ""
-        ChartLabel(legend, "±${span.roundToInt()} ms$recent")
+        val tMin = fromSeconds.coerceIn(0f, tMax - 1f)
+        ChartLabel(legend, "±${span.roundToInt()} ms$spanLabel")
         Canvas(modifier = Modifier.fillMaxWidth().weight(1f)) {
             val mid = size.height / 2
             val r = 1.8.dp.toPx()
@@ -656,6 +690,9 @@ private fun TimingTrace(
 @Composable
 private fun ProgressChart(
     history: List<MainViewModel.HistoryPoint>,
+    /** Start of the time span shown, in seconds since the start of the session. */
+    fromSeconds: Float,
+    spanLabel: String,
     modifier: Modifier = Modifier,
 ) {
     val last = history.last()
@@ -667,10 +704,13 @@ private fun ProgressChart(
     val lineColor = MaterialTheme.colorScheme.primary
     val axis = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.3f)
     Column(modifier = modifier) {
-        ChartLabel("Rate over time", "${signed(center - range)} … ${signed(center + range)} s/week")
+        ChartLabel("Rate over time$spanLabel", "${signed(center - range)} … ${signed(center + range)} s/week")
         Canvas(modifier = Modifier.fillMaxWidth().weight(1f)) {
             val tMax = maxOf(last.elapsedSeconds, 1f)
-            fun x(t: Float) = t / tMax * size.width
+            val tMin = fromSeconds.coerceIn(0f, tMax - 1f)
+            // Points before the span keep their true position and are clipped, so
+            // the line enters from the left edge.
+            fun x(t: Float) = (t - tMin) / (tMax - tMin) * size.width
             // Points outside the view keep their true position, so segments leave
             // the chart where they cross its edge. The limit only keeps wild early
             // estimates within float range; it moves edge crossings by under a pixel.
