@@ -155,7 +155,9 @@ fun ClockTunerScreen(
             // Period (shown once available); after stop it is the session's result.
             if (state.periodMicros > 0) {
                 PeriodDisplay(
-                    label = if (state.running) "Live" else "Final",
+                    // Past the result window the number describes only its latest part.
+                    label = (if (state.running) "Live" else "Final") +
+                        if (state.elapsedSeconds > TickDetector.RESULT_WINDOW_SECONDS) ", last 30 min" else "",
                     periodMicros = state.periodMicros,
                     uncertaintyMicros = state.uncertaintyMicros,
                     synced = state.synced,

@@ -159,7 +159,6 @@ class TickDetector(
     val detectedBeats: List<Beat> get() = beats
 
     // ---- Published estimate ----
-    private var fit: Fit? = null
     private var periodMicros = 0.0
     private var uncertaintyMicros = 0.0
     private var imbalanceMicros = 0.0
@@ -299,7 +298,6 @@ class TickDetector(
         consecutiveMisses = 0
         recentResidualCount.fill(0)
         windowSamples = maxWindowSamples
-        fit = null
         periodMicros = 0.0; uncertaintyMicros = 0.0
         imbalanceMicros = 0.0; imbalanceUncertaintyMicros = 0.0
         trace = emptyList()
@@ -587,9 +585,16 @@ class TickDetector(
 
     private fun refit() {
         val profile = ClockProfile.forPeriod(model[2] / sampleRate, profiles)
-        val f = fitBeats(beats.map { it.k }, beats.map { it.parity }, beats.map { it.sample }, profile,
+        // The result describes the last RESULT_WINDOW_SECONDS: long enough to
+        // average out the escape-wheel pattern and short-term wander, short
+        // enough to follow a rate that drifts over hours. Shorter sessions use
+        // all their beats.
+        val windowStart = beats.last().sample - samplesFor(RESULT_WINDOW_SECONDS)
+        var from = beats.size
+        while (from > 0 && beats[from - 1].sample >= windowStart) from--
+        val recent = beats.subList(from, beats.size)
+        val f = fitBeats(recent.map { it.k }, recent.map { it.parity }, recent.map { it.sample }, profile,
             toothConfirmed) ?: return
-        fit = f
         if (f.recognised != null && !toothConfirmed) {
             toothConfirmed = true
             logger?.log("CLOCK", "recognised the %s: its %d-tooth escape-wheel pattern matches the beats"
@@ -1097,6 +1102,8 @@ class TickDetector(
         const val SYNCED_SEC_PER_WEEK = 10.0
         /** Span of the timing trace, in seconds; longer sessions show only their latest part. */
         const val TRACE_SECONDS = 600f
+        /** The published rate, uncertainty and imbalance describe the last this many seconds. */
+        const val RESULT_WINDOW_SECONDS = 1800.0
         /** Most time bins per beat type in the whole-session trace of a long session. */
         const val SESSION_TRACE_BINS = 300
         /** Narrowest bin of the whole-session trace; wider bins double it. */

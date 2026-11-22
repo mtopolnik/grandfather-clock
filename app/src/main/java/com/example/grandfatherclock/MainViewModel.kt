@@ -265,6 +265,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 put("beatCount", s.beatCount)
                 put("periodMicros", s.periodMicros)
                 put("uncertaintyMicros", s.uncertaintyMicros)
+                // The period, its uncertainty and the imbalance describe this last part of the session.
+                put("periodWindowSeconds", minOf(s.elapsedSeconds, TickDetector.RESULT_WINDOW_SECONDS))
                 s.rateTrend?.let {
                     put("rateTrend", JSONObject().apply {
                         put("startPeriodMicros", it.startPeriodMicros)
