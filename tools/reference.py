@@ -29,6 +29,7 @@ from scipy import signal
 SR = 44100
 HOP = 44                       # ~1 ms envelope hop
 SKIP_NAMES = {"clock_idealized.wav"}
+MAX_SCAN_BYTES = 1 << 30        # ~3.4 hours of 44.1 kHz mono 16-bit
 
 
 def load(path):
@@ -237,9 +238,17 @@ def main():
     ap.add_argument("wavs", nargs="*")
     a = ap.parse_args()
     root = os.path.abspath(a.root)
-    wavs = a.wavs or sorted(
-        os.path.join(d, f) for d, _, fs in os.walk(root) for f in fs
-        if f.endswith(".wav") and f not in SKIP_NAMES)
+    wavs = a.wavs
+    if not wavs:
+        wavs = []
+        for path in sorted(os.path.join(d, f) for d, _, fs in os.walk(root) for f in fs
+                           if f.endswith(".wav") and f not in SKIP_NAMES):
+            # The analysis holds a whole file in memory several times over, so
+            # recordings of hours are left out of the scan.
+            if os.path.getsize(path) > MAX_SCAN_BYTES:
+                print("%-50s skipped: longer than the scan handles" % os.path.relpath(path, root), file=sys.stderr)
+                continue
+            wavs.append(path)
     refs = {}
     if os.path.exists(a.out):
         with open(a.out) as fh:

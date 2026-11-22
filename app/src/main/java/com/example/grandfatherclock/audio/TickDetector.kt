@@ -48,6 +48,12 @@ class TickDetector(
         val inlier: Boolean,
     )
 
+    /**
+     * A change of the clock's rate during the session: the period at the start
+     * and at the end of a straight line through the rates of 10-minute blocks.
+     */
+    data class RateTrend(val startPeriodMicros: Double, val endPeriodMicros: Double, val spanSeconds: Double)
+
     /** A tracked beat. [k] counts full periods; [parity] 0 = tick, 1 = tock. */
     data class Beat(val k: Int, val parity: Int, val sample: Double, val snr: Double)
 
@@ -75,6 +81,8 @@ class TickDetector(
         val trace: List<TracePoint> = emptyList(),
         /** The known clock whose escape-wheel pattern the beats confirmed, or null. */
         val recognisedClock: ClockProfile? = null,
+        /** A significant change of rate during the session, or null. */
+        val rateTrend: RateTrend? = null,
     )
 
     // ---- Envelope ----
@@ -117,7 +125,11 @@ class TickDetector(
     private var flashParity = 1
 
     // ---- Tracking ----
-    private val model = DoubleArray(3)                        // a0, a1 (samples), P (samples)
+    /**
+     * The line that predicts beat slots: a0, a1 (samples), P (samples). Set from
+     * the lock, then refitted to the most recent beats after every beat heard.
+     */
+    private val model = DoubleArray(3)
     private val nextK = IntArray(2)
     private var windowSamples = samplesFor(0.060)
     private val minWindowSamples = samplesFor(0.025)
@@ -145,6 +157,7 @@ class TickDetector(
     private var imbalanceUncertaintyMicros = 0.0
     private var trace: List<TracePoint> = emptyList()
     private var recognisedClock: ClockProfile? = null
+    private var rateTrend: RateTrend? = null
     /** The recognised clock's tooth count has been confirmed by this session's beats. */
     private var toothConfirmed = false
     private var synced = false
@@ -231,6 +244,7 @@ class TickDetector(
         recentHitRate = recentHitRate(),
         trace = trace,
         recognisedClock = recognisedClock,
+        rateTrend = rateTrend,
     )
 
     private fun updateNoiseFloor() {
@@ -277,6 +291,7 @@ class TickDetector(
         trace = emptyList()
         recognisedClock = null
         toothConfirmed = false
+        rateTrend = null
         synced = false
     }
 
@@ -505,6 +520,7 @@ class TickDetector(
             consecutiveMisses = 0
             recentResiduals[parity][recentResidualCount[parity] % recentResiduals[parity].size] = onset - linePred
             recentResidualCount[parity]++
+            updateTrackingModel()
             // Each refit costs time in proportion to the beats so far and runs on
             // the audio thread. Refitting every (beats / FULL_REFIT_BEATS)-th beat
             // keeps the average cost per beat bounded in sessions lasting hours.
@@ -561,10 +577,6 @@ class TickDetector(
             logger?.log("CLOCK", "recognised the %s: its %d-tooth escape-wheel pattern matches the beats"
                 .format(profile.name, profile.escapeWheelTeeth))
         }
-        model[0] = f.a0; model[1] = f.a1; model[2] = f.linePeriod
-        if (f.inliers >= 16) {
-            windowSamples = (4 * f.residualSigma).coerceIn(minWindowSamples, maxWindowSamples)
-        }
         val toMicros = 1e6 / sampleRate
         if (f.n0 >= 3 && f.n1 >= 3 && f.spanSamples >= 2 * f.period) {
             periodMicros = f.period * toMicros
@@ -572,19 +584,25 @@ class TickDetector(
             imbalanceMicros = f.imbalance * toMicros
             imbalanceUncertaintyMicros = f.imbalanceSigma * toMicros
             recognisedClock = f.recognised
+            rateTrend = findRateTrend()
             val secPerWeek = uncertaintyMicros / periodMicros * 604_800.0
-            synced = secPerWeek <= SYNCED_SEC_PER_WEEK && recentHitRate() >= 0.8
+            // A drifting rate has no single value to settle on.
+            synced = secPerWeek <= SYNCED_SEC_PER_WEEK && recentHitRate() >= 0.8 && rateTrend == null
         }
+        // The trace shows each beat's offset from a line fitted to the beats it
+        // spans, so it stays centred when the clock's rate drifts over hours.
         val traceStart = totalSamples - samplesFor(TRACE_SECONDS.toDouble())
         var first = beats.size
         while (first > 0 && beats[first - 1].sample >= traceStart) first--
-        trace = (first until beats.size).map { i ->
+        val traceLine = robustLine(first, beats.size, model)
+        trace = if (traceLine == null) emptyList() else (first until beats.size).map { i ->
             val b = beats[i]
+            val line = traceLine.line
             TracePoint(
                 timeSeconds = (b.sample / sampleRate).toFloat(),
-                residualMillis = ((b.sample - (model[b.parity] + b.k * model[2])) * 1000 / sampleRate).toFloat(),
+                residualMillis = ((b.sample - (line[b.parity] + b.k * line[2])) * 1000 / sampleRate).toFloat(),
                 isTick = b.parity == 0,
-                inlier = f.inlier[i],
+                inlier = traceLine.inlier[i - first],
             )
         }
         if (beats.size % 20 == 0) {
@@ -595,18 +613,119 @@ class TickDetector(
         }
     }
 
+    /**
+     * Refits the prediction line to the last [TRACK_BEATS] beats, so tracking
+     * follows the clock when its rate changes during a long session. The search
+     * window is sized from the beats' scatter around that line.
+     */
+    private fun updateTrackingModel() {
+        val from = maxOf(0, beats.size - TRACK_BEATS)
+        if (beats.size - from < 8) return
+        val r = robustLine(from, beats.size, model) ?: return
+        r.line.copyInto(model)
+        if (beats.size - from >= 16) {
+            windowSamples = (4 * r.sigma).coerceIn(minWindowSamples, maxWindowSamples)
+        }
+    }
+
+    /**
+     * Looks for a change of rate over a session of an hour or more: fits a
+     * straight line to the periods of consecutive 10-minute blocks and reports
+     * it when its change is beyond [TREND_SIGMAS] standard errors (judged from
+     * the blocks' scatter around it) and at least [SYNCED_SEC_PER_WEEK].
+     * Shorter sessions can't tell a trend from the clock's irregular wander.
+     */
+    private fun findRateTrend(): RateTrend? {
+        if (beats.size < 2) return null
+        val t0 = beats.first().sample
+        if (beats.last().sample - t0 < samplesFor(TREND_MIN_SECONDS)) return null
+        val block = samplesFor(TREND_BLOCK_SECONDS)
+        val centres = ArrayList<Double>(); val periods = ArrayList<Double>()
+        var from = 0
+        while (from < beats.size) {
+            val b = ((beats[from].sample - t0) / block).toInt()
+            var to = from
+            while (to < beats.size && ((beats[to].sample - t0) / block).toInt() == b) to++
+            // Only blocks heard well and in full count.
+            if (to - from >= 100 && beats[to - 1].sample - beats[from].sample >= 0.9 * block) {
+                robustLine(from, to, model)?.let {
+                    centres += (beats[from].sample + beats[to - 1].sample) / 2
+                    periods += it.line[2]
+                }
+            }
+            from = to
+        }
+        val n = centres.size
+        if (n < 6) return null
+        val cm = centres.average(); val pm = periods.average()
+        var sxx = 0.0; var sxy = 0.0
+        for (i in 0 until n) { val dc = centres[i] - cm; sxx += dc * dc; sxy += dc * (periods[i] - pm) }
+        val slope = sxy / sxx
+        var ss = 0.0
+        for (i in 0 until n) { val r = periods[i] - (pm + slope * (centres[i] - cm)); ss += r * r }
+        val se = sqrt(ss / (n - 2) / sxx)
+        val start = pm + slope * (centres.first() - cm)
+        val end = pm + slope * (centres.last() - cm)
+        val changeSecPerWeek = abs(end - start) / pm * 604_800.0
+        if (abs(slope) <= TREND_SIGMAS * se || changeSecPerWeek < SYNCED_SEC_PER_WEEK) return null
+        val toMicros = 1e6 / sampleRate
+        return RateTrend(start * toMicros, end * toMicros, (centres.last() - centres.first()) / sampleRate)
+    }
+
+    private class LineResult(val line: DoubleArray, val sigma: Double, val inlier: BooleanArray)
+
+    /**
+     * Fits t = a[parity] + P·k to beats[from until to] by least squares, leaving
+     * out beats beyond five robust standard deviations (at least 2 ms). When one
+     * beat type is absent, its offset keeps its distance to the other type's
+     * offset in [previous].
+     */
+    private fun robustLine(from: Int, to: Int, previous: DoubleArray): LineResult? {
+        val n = to - from
+        if (n < 3) return null
+        val inl = BooleanArray(n) { true }
+        var line: DoubleArray? = null
+        var sigma = 0.0
+        val floor = samplesFor(0.002)
+        repeat(3) {
+            val sk = DoubleArray(2); val st = DoubleArray(2); val c = IntArray(2)
+            for (i in 0 until n) if (inl[i]) {
+                val b = beats[from + i]
+                sk[b.parity] += b.k.toDouble(); st[b.parity] += b.sample; c[b.parity]++
+            }
+            if (c[0] + c[1] < 3) return null
+            var sxy = 0.0; var sxx = 0.0
+            for (i in 0 until n) if (inl[i]) {
+                val b = beats[from + i]
+                val dk = b.k - sk[b.parity] / c[b.parity]
+                sxy += dk * (b.sample - st[b.parity] / c[b.parity]); sxx += dk * dk
+            }
+            if (sxx <= 0) return null
+            val p = sxy / sxx
+            if (p <= 0) return null
+            val a = DoubleArray(2) { g -> if (c[g] > 0) (st[g] - p * sk[g]) / c[g] else Double.NaN }
+            for (g in 0..1) if (c[g] == 0) a[g] = a[1 - g] + (previous[g] - previous[1 - g])
+            val fitted = doubleArrayOf(a[0], a[1], p)
+            val res = DoubleArray(n) { i -> beats[from + i].let { it.sample - (fitted[it.parity] + p * it.k) } }
+            val rIn = res.filterIndexed { i, _ -> inl[i] }
+            val med = median(rIn)
+            sigma = 1.4826 * median(rIn.map { abs(it - med) })
+            val cutoff = maxOf(5 * sigma, floor)
+            for (i in 0 until n) inl[i] = abs(res[i]) <= cutoff
+            line = fitted
+        }
+        return line?.let { LineResult(it, sigma, inl) }
+    }
+
     // ================================================================
     //  Fit: t = a[parity] + P·k
     // ================================================================
 
     private class Fit(
-        /** The straight lines' offsets and shared period, used for predicting beats. */
-        val a0: Double, val a1: Double, val linePeriod: Double,
-        /** The best period estimate: per-tooth when the clock is recognised, else [linePeriod]. */
+        /** The best period estimate: per-tooth when the clock is recognised, else the straight line's. */
         val period: Double,
         /** The known clock whose tooth pattern the beats confirmed, or null. */
         val recognised: ClockProfile?,
-        val inlier: BooleanArray, val inliers: Int,
         val n0: Int, val n1: Int,
         /** Robust scatter of the beats around the line, in samples. */
         val residualSigma: Double,
@@ -704,7 +823,7 @@ class TickDetector(
 
         val rrMedian = median(rr)
         return Fit(
-            a0, a1, p, period, recognised, inl, m, n0, n1,
+            period, recognised, n0, n1,
             residualSigma = 1.4826 * median(rr.map { abs(it - rrMedian) }),
             periodSigma = periodSigma,
             imbalance = (a1 - a0) - p / 2,
@@ -922,6 +1041,20 @@ class TickDetector(
         const val TRACE_SECONDS = 600f
         /** Beats up to which every new beat triggers a refit; beyond it refits are spaced out. */
         private const val FULL_REFIT_BEATS = 2000
+        /**
+         * Recent beats the prediction line is fitted to: 4–5 minutes for these
+         * clocks. Long enough that a few seconds of loud sounds taken for beats
+         * (the strike) barely move it; short enough to follow a rate that drifts
+         * over hours, which changes the timing by well under a millisecond
+         * within this span.
+         */
+        private const val TRACK_BEATS = 400
+        /** Sessions shorter than this don't get a rate trend; the clock's wander would dominate. */
+        private const val TREND_MIN_SECONDS = 3600.0
+        /** Length of the blocks whose rates the trend is fitted to. */
+        private const val TREND_BLOCK_SECONDS = 600.0
+        /** Standard errors the trend's slope must exceed to be reported. */
+        private const val TREND_SIGMAS = 3.0
         /** Share of periods in which each beat must be heard before the rhythm counts as found. */
         private const val MIN_LOCK_COVERAGE = 0.6
         /**

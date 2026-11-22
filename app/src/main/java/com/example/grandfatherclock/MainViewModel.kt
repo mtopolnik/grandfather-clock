@@ -60,6 +60,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val history: List<HistoryPoint> = emptyList(),
         /** The known clock the beats were matched to, or null. */
         val recognisedClock: ClockProfile? = null,
+        /** A significant change of rate during the session, or null. */
+        val rateTrend: TickDetector.RateTrend? = null,
         /** null = idle, true = tick, false = tock */
         val lastBeatIsTick: Boolean? = null,
         val flashTrigger: Int = 0,
@@ -164,6 +166,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     trace = s.trace,
                     history = history,
                     recognisedClock = s.recognisedClock,
+                    rateTrend = s.rateTrend?.let {
+                        it.copy(startPeriodMicros = it.startPeriodMicros * corr, endPeriodMicros = it.endPeriodMicros * corr)
+                    },
                     imbalanceMicros = s.imbalanceMicros * corr,
                     imbalanceUncertaintyMicros = s.imbalanceUncertaintyMicros * corr,
                     lastBeatIsTick = if (s.newBeat) s.lastBeatIsTick else _state.value.lastBeatIsTick,
@@ -257,6 +262,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 put("beatCount", s.beatCount)
                 put("periodMicros", s.periodMicros)
                 put("uncertaintyMicros", s.uncertaintyMicros)
+                s.rateTrend?.let {
+                    put("rateTrend", JSONObject().apply {
+                        put("startPeriodMicros", it.startPeriodMicros)
+                        put("endPeriodMicros", it.endPeriodMicros)
+                        put("spanSeconds", it.spanSeconds)
+                    })
+                }
                 put("imbalanceMicros", s.imbalanceMicros)
                 put("imbalanceUncertaintyMicros", s.imbalanceUncertaintyMicros)
                 // The WAV header always says 44100 Hz; this is the rate the app measured.

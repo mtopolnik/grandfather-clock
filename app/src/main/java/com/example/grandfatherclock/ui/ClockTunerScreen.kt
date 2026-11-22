@@ -63,6 +63,7 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.grandfatherclock.MainViewModel
+import com.example.grandfatherclock.audio.ClockProfile
 import com.example.grandfatherclock.audio.TickDetector
 import com.example.grandfatherclock.data.SessionStore
 import com.example.grandfatherclock.ui.theme.IdleGray
@@ -136,12 +137,14 @@ fun ClockTunerScreen(
             verticalArrangement = Arrangement.Center,
         ) {
             // Flashing circle
+            // The circle names a known clock once its beat rate is measured, and
+            // shows the beats per minute for any other clock.
             val bpm = if (state.periodMicros > 0) SessionStore.classifyBpm(state.periodMicros) else null
             FlashingCircle(
                 lastBeatIsTick = state.lastBeatIsTick,
                 flashTrigger = state.flashTrigger,
                 synced = state.synced,
-                bpm = bpm,
+                label = bpm?.let { b -> ClockProfile.KNOWN.firstOrNull { it.bpm == b }?.name ?: "$b" },
             )
 
             Spacer(modifier = Modifier.height(24.dp))
@@ -159,6 +162,11 @@ fun ClockTunerScreen(
             if (state.audioClockSuspect) {
                 Spacer(modifier = Modifier.height(16.dp))
                 AudioClockWarning(state.crystalBiasPpm)
+            }
+
+            state.rateTrend?.let { trend ->
+                Spacer(modifier = Modifier.height(8.dp))
+                RateTrendNotice(trend)
             }
 
             Spacer(modifier = Modifier.height(20.dp))
@@ -370,7 +378,7 @@ private fun FlashingCircle(
     lastBeatIsTick: Boolean?,
     flashTrigger: Int,
     synced: Boolean,
-    bpm: Int? = null,
+    label: String? = null,
 ) {
     var flashColor by remember { mutableStateOf(Color.Transparent) }
 
@@ -402,10 +410,11 @@ private fun FlashingCircle(
             .background(animatedColor),
         contentAlignment = Alignment.Center,
     ) {
-        if (bpm != null) {
+        if (label != null) {
             Text(
-                text = "$bpm",
-                fontSize = 32.sp,
+                text = label,
+                // A beat rate is a few digits; a clock's name needs a smaller size to fit.
+                fontSize = if (label.length <= 3) 32.sp else 18.sp,
                 fontWeight = FontWeight.Bold,
                 color = MaterialTheme.colorScheme.onBackground,
             )
@@ -534,6 +543,26 @@ private fun AudioClockWarning(offsetPpm: Double) {
             )
         }
     }
+}
+
+/**
+ * One line shown when the clock's rate changed significantly during a long
+ * session: the rate at its start and end, so the result reads as an average.
+ */
+@Composable
+private fun RateTrendNotice(trend: TickDetector.RateTrend) {
+    val bpm = SessionStore.classifyBpm(trend.endPeriodMicros)
+    val ideal = 2.0 * 60_000_000.0 / bpm
+    fun secPerWeek(p: Double) = (ideal - p) / ideal * 604_800.0
+    Text(
+        text = String.format(Locale.US, "Drifting %s \u2192 %s s/week in %.1f h",
+            signed(secPerWeek(trend.startPeriodMicros)), signed(secPerWeek(trend.endPeriodMicros)),
+            trend.spanSeconds / 3600),
+        style = MaterialTheme.typography.titleMedium,
+        fontWeight = FontWeight.Bold,
+        color = WarningAmber,
+        textAlign = TextAlign.Center,
+    )
 }
 
 /**
